@@ -1,0 +1,18 @@
+# CLI interface
+click
+
+# OpenAI API
+openai
+tiktoken  # For counting tokens (used in cost tracking)
+
+# Local HTTP requests (Ollama)
+requests
+
+# Environment/config loading
+python-dotenv
+
+# Required for license inspection (via pkg_resources)
+setuptools
+
+# Optional but useful for type hints and compatibility
+typing-extensions

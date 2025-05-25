@@ -61,7 +61,7 @@ Commands:
   analyze       Run full code and license analysis
   suggest       Suggest AI-powered refactorings
   add-tests     Generate unit test stubs from source code
-  refactor      Apply automatic refactor suggestions (WIP)
+  refactor      Apply automatic refactor suggestions (TODO: Will be implemented in the next version)
 ```
 
 ## 📁 Output
