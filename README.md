@@ -73,9 +73,8 @@ Commands:
 - Enable `.env` support to manage keys and config.
 
 ## 🧠 Coming soon
+- Automatic refactoring
 - Before/after refactor trace logging
-- Fine-tuning support (LoRA, QLoRA)
-- VS Code integration
 
 ---
 
