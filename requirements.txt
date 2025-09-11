@@ -16,3 +16,5 @@ setuptools
 
 # Optional but useful for type hints and compatibility
 typing-extensions
+
+rich
