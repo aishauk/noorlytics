@@ -83,6 +83,7 @@ Commands:
 When running **Ollama locally** (`http://localhost:11434`), network latency is negligible.  
 - Recommended: `NOOR_HTTP_TIMEOUT=30`, `NOOR_KEEP_ALIVE=5m`  
 - Local models start quickly but consume more RAM if kept alive for too long.
+- **Local models can be slow to generate results, depending on your CPU/GPU and RAM.**
 
 When running **remote Ollama** (e.g. Runpod, cloud instance), you should increase values in `.env` file:  
 - Recommended: `NOOR_HTTP_TIMEOUT=120`, `NOOR_KEEP_ALIVE=30m`  
