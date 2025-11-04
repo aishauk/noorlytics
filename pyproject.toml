@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noorlytics"
+version = "0.1.0"
+description = "Noorlytics — AI-powered technical debt analyzer (local Ollama or OpenAI)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Aisha Kujovic Ugljanin" }]
+keywords = ["technical debt", "ai", "cli", "code quality", "refactoring"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+# Bas-dependencies
+dependencies = [
+  "click",
+  "python-dotenv",
+  "requests",
+  "rich",
+  "typing-extensions",
+  "setuptools",
+]
+
+[project.optional-dependencies]
+openai = ["openai", "tiktoken"]
+ollama = []  # vi anropar Ollama via HTTP
+
+[project.scripts]
+noor = "noorlytics.cli.run:cli"
+
+[tool.setuptools]
+packages = ["noorlytics"]
+include-package-data = true

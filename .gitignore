@@ -1,0 +1,20 @@
+# Python/venv/build
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Local config
+.env
+.env.local
+
+# Generated
+reports/

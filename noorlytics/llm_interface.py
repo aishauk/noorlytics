@@ -1,6 +1,8 @@
+# noorlytics/llm_interface.py
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import openai
@@ -103,9 +105,12 @@ class LLMClient:
     # ----- High-level helpers -----
 
     def analyze_text(self, filename: str, content: str) -> str:
+        # Slightly opinionated prompt to keep headings stable for the CLI renderer.
         sys = (
             "You analyze code for technical debt, risks, smells, and modernization opportunities. "
-            "Return a concise Markdown report with sections: Summary, Findings, Impact, Suggested Actions."
+            "Return concise Markdown with these H2 headings in this exact order:\n"
+            "## Summary\n## Findings\n## Impact\n## Suggested Actions\n"
+            "Use bullets for lists. Keep lines short."
         )
         user = f"File: {filename}\n\n```text\n{content}\n```"
         return self.chat(
@@ -149,6 +154,7 @@ class LLMClient:
 
 
 def render_progress(description: str):
+    """Small progress spinner renderer used by CLI commands."""
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold]" + description + "[/bold]"),
@@ -157,4 +163,86 @@ def render_progress(description: str):
 
 
 def pretty_json(obj: Any) -> str:
+    """Deterministic pretty JSON (UTF-8, two spaces)."""
     return json.dumps(obj, indent=2, ensure_ascii=False)
+
+# --- Minimal pretty CLI renderer for Markdown output (analyze/suggest/refactor) ---
+
+def render_markdown_cli(title: str, md_text: str, saved_path: Optional[Path] = None) -> None:
+    """
+    Pretty-print a Markdown report with colored section headers.
+    No big box header, just clean dividers per section.
+    """
+    try:
+        import os
+        from rich.console import Console
+        from rich.rule import Rule
+        from rich.markdown import Markdown
+
+        if os.environ.get("NO_COLOR"):
+            raise RuntimeError("NO_COLOR set")
+
+        console = Console(highlight=False, force_terminal=True)
+
+        # Split on H2 headings ("## ")
+        sections = []
+        current_title = None
+        current_lines = []
+        for line in md_text.splitlines():
+            if line.startswith("## "):
+                if current_title is not None:
+                    sections.append((current_title, "\n".join(current_lines).strip()))
+                current_title = line[3:].strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_title is not None:
+            sections.append((current_title, "\n".join(current_lines).strip()))
+        else:
+            sections = [("Report", md_text.strip())]
+
+        # Color per section
+        colors = {
+            "summary": "bright_cyan",
+            "findings": "magenta",
+            "impact": "yellow",
+            "suggested actions": "green",
+            "suggestions": "green",
+        }
+
+        # Print each section with a colored rule
+        console.print(f"[bold underline]{title}[/bold underline]\n", style="bright_green")
+        for sec_title, body in sections:
+            key = sec_title.lower()
+            color = colors.get(key, "bright_cyan")
+            console.print(Rule(f"[bold]{sec_title}[/bold]", style=color))
+            console.print(Markdown(body or "_(empty)_", code_theme="ansi_dark"))
+            console.print()
+
+        if saved_path:
+            demo_path = _relpath_for_demo(saved_path, base=saved_path.parent.parent)  # show "reports/…"
+            console.print(f"[bold green]Saved →[/bold green] [italic]{demo_path}[/]")
+
+    except Exception:
+        # Plain fallback (no Rich / NO_COLOR)
+        print(md_text)
+        if saved_path:
+            demo_path = _relpath_for_demo(saved_path, base=saved_path.parent.parent)
+            print(f"\nSaved → {demo_path}")
+
+
+def _relpath_for_demo(p: Path, base: Optional[Path] = None) -> str:
+    """
+    Return a shortened path for demo display.
+    If base is given (e.g., project root or reports dir), return relative to that.
+    Otherwise just the last two path parts.
+    """
+    try:
+        if base and p.is_absolute():
+            return str(p.relative_to(base))
+    except Exception:
+        pass
+    # Fallback: keep only the tail
+    parts = p.parts
+    return str(Path(*parts[-2:]))
+

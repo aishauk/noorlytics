@@ -1,0 +1,37 @@
+{
+  "name": "noorlytics",
+  "version": "0.1.0",
+  "description": "AI-driven CLI for analyzing technical debt, dependencies, licenses, and structure in your codebase.",
+  "main": "index.js",
+  "bin": {
+    "noor": "bin/noor.js"
+  },
+  "scripts": {
+    "start": "node bin/noor.js --help",
+    "test": "jest"
+  },
+  "keywords": [
+    "cli",
+    "ai",
+    "llm",
+    "technical-debt",
+    "refactoring",
+    "dependency-analysis"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^11.0.0",
+    "ora": "^7.0.0",
+    "axios": "^1.6.0",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "eslint": "^8.56.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,2 +1,32 @@
+# ❌ INTENTIONALLY INSECURE / BAD DEMO REQUIREMENTS — do NOT use in production
+
+# Unpinned → nondeterministic
 requests
-openai
+aiohttp
+
+# Very old / frequently vulnerable stacks
+urllib3==1.24.1
+Django==1.11.1
+Flask==0.12
+Jinja2==2.10
+MarkupSafe==1.1.1
+PyYAML==3.12
+Pillow==5.4.1
+cryptography==2.1.4
+paramiko==2.0.0
+rsa==3.4.2
+bleach==2.0.0
+lxml==3.7.2
+tornado==4.2
+Werkzeug==0.14.1
+numpy==1.13.0
+pandas==0.20.3
+setuptools==39.0.1
+
+# Potential license headaches / legacy DB drivers
+psycopg2==2.7.1
+mysqlclient==1.3.7
+
+# Conflicting constraints (resolver pain)
+Pillow<6
+urllib3<1.25
