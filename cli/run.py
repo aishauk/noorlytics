@@ -337,6 +337,7 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
         _save_and_print(notes_md, out_md, header=f"{manifest.name} – dependencies")
 
 
+
 @cli.command("refactor")
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.pass_obj

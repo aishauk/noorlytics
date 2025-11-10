@@ -1,8 +1,9 @@
 import hashlib, json, os, platform, time
+import sys
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-LICENSE_SERVER = os.getenv("NOOR_LICENSE_SERVER", "http://127.0.0.1:9000")
+LICENSE_SERVER = os.getenv("NOOR_LICENSE_SERVER", "https://noor-license.onrender.com")
 TIMEOUT = 5
 
 def device_fingerprint() -> str:
@@ -10,14 +11,19 @@ def device_fingerprint() -> str:
     return hashlib.sha256(base.encode()).hexdigest()[:16]
 
 def check_and_consume(license_key: str, product: str, consume: bool = True) -> dict:
+    license_key = (license_key or "").strip()
+    if not license_key:
+        return {"ok": False, "error": "no_license_key"}
+
     payload = {
-        "license_key": license_key.strip(),
+        "license_key": license_key,
         "product": product,
         "device": device_fingerprint(),
         "consume": consume,
         "ts": int(time.time()),
         "version": os.getenv("NOOR_VERSION", "0.1.0"),
     }
+    
     data = json.dumps(payload).encode("utf-8")
     req = Request(f"{LICENSE_SERVER}/issue", data=data, headers={"Content-Type":"application/json"}, method="POST")
     try:
@@ -27,3 +33,67 @@ def check_and_consume(license_key: str, product: str, consume: bool = True) -> d
         return {"ok": False, "error": f"http {e.code}"}
     except URLError:
         return {"ok": False, "error": "license_server_unreachable"}
+
+def require_valid_license(license_key: str, product: str):
+    """
+    Check license before running a command.
+    Exits the program if license is invalid or quota exhausted.
+    """
+    result = check_and_consume(license_key, product)
+    if not result.get("ok"):
+        error = result.get("error", "unknown_error")
+        remaining = result.get("remaining", "?")
+        if error == "free_runs_exhausted":
+            print(f"❌ Free plan limit reached. Remaining: 0")
+        elif error == "device_mismatch":
+            print(f"❌ License is already bound to another device.")
+        elif error == "http 401":
+            print(f"❌ Invalid license key.")
+        elif error == "license_server_unreachable":
+            print(f"❌ Could not reach license server.")
+        else:
+            print(f"❌ License check failed: {error} (remaining={remaining})")
+        sys.exit(1)
+
+    plan = result.get("plan", "unknown")
+    remaining = result.get("remaining", "?")
+    print(f"✅ License OK (plan={plan}, remaining≈{remaining})")
+
+def require_license_or_exit(product: str, license_key: str | None = None):
+    """
+    Check license before running a command.
+    - Hämtar key från argument eller NOOR_LICENSE_KEY env var.
+    - Avslutar programmet med ett tydligt felmeddelande om något är fel.
+    """
+    # 1) Hämta licensnyckel
+    key = (license_key or "").strip() or os.getenv("NOOR_LICENSE_KEY", "").strip()
+    if not key:
+        print("❌ No license key provided. Set NOOR_LICENSE_KEY or use --license-key.", file=sys.stderr)
+        sys.exit(1)
+
+    # 2) Kolla med servern
+    result = check_and_consume(key, product, consume=True)
+
+    if not result.get("ok"):
+        error = result.get("error", "unknown_error")
+        remaining = result.get("remaining")
+
+        if error == "free_runs_exhausted":
+            print("❌ Free plan limit reached (no runs remaining). Upgrade to Pro to continue.", file=sys.stderr)
+        elif error == "device_mismatch":
+            print("❌ License is already bound to another device.", file=sys.stderr)
+        elif error.startswith("http "):
+            print(f"❌ License server returned an HTTP error: {error}", file=sys.stderr)
+        elif error == "license_server_unreachable":
+            print("❌ Could not reach license server. Check your network connection.", file=sys.stderr)
+        else:
+            print(f"❌ License check failed: {error} (remaining={remaining})", file=sys.stderr)
+        sys.exit(1)
+
+    # 3) Snygg liten bekräftelse
+    plan = result.get("plan", "unknown")
+    remaining = result.get("remaining")
+    if remaining is not None:
+        print(f"✅ License OK (plan={plan}, remaining≈{remaining})")
+    else:
+        print(f"✅ License OK (plan={plan})")
