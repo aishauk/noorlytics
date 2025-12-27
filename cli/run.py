@@ -17,7 +17,7 @@ from noorlytics.analyze_dependencies import (
     render_vulns_cli,
 )
 from noorlytics.add_tests import generate_unit_tests, render_tests_cli
-from noorlytics.licensing import check_and_consume
+from noorlytics.licensing import check_and_consume, ensure_license_server_up, get_license_status
 
 
 # -------------------- Constants --------------------
@@ -114,21 +114,9 @@ def _save_and_print(text: str, out_path: Path, header: str | None = None):
 @click.group(context_settings=CONTEXT_SETTINGS)
 @click.option("--mode", type=click.Choice(["ollama", "openai"]), default=None,
               help="Choose LLM backend. If omitted, uses .env/settings value.")
-@click.option("--reports-dir", type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
-              default=None, help="Directory where reports will be saved (default: from settings).")
-@click.option("--allowed-ext", type=str, default=None,
-              help="Comma-separated list of extensions to include (e.g., .py,.js).")
-@click.option("--max-file-bytes", type=int, default=None,
-              help="Maximum file size in bytes (default: from settings).")
-@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
 @click.version_option(package_name="noorlytics", prog_name="noor")
 @click.pass_context
-def cli(ctx: click.Context,
-        mode: Optional[str],
-        reports_dir: Optional[Path],
-        allowed_ext: Optional[str],
-        max_file_bytes: Optional[int],
-        verbose: bool):
+def cli(ctx: click.Context, mode: Optional[str]):
     """
     Noorlytics CLI — AI-powered technical debt analysis, refactoring suggestions,
     unit test generation, and dependency audits.
@@ -141,44 +129,43 @@ def cli(ctx: click.Context,
     """
     S = get_settings()
 
-    # Resolve configuration from CLI flags, env vars, or defaults
     resolved_mode = _resolve_mode(mode)
-    resolved_reports = reports_dir or getattr(S, "reports_dir", Path("reports"))
+    resolved_reports = getattr(S, "reports_dir", Path("reports"))
     if isinstance(resolved_reports, str):
         resolved_reports = Path(resolved_reports)
 
     settings_ext = getattr(S, "allowed_ext", [".py"])
     if isinstance(settings_ext, str):
         settings_ext = [settings_ext]
-    resolved_ext = set(map(str.lower, (allowed_ext.split(",") if allowed_ext else settings_ext)))
+    resolved_ext = set(map(str.lower, settings_ext))
 
-    resolved_max = max_file_bytes if max_file_bytes is not None else getattr(S, "max_file_bytes", 400_000)
+    resolved_max = getattr(S, "max_file_bytes", 400_000)
 
     ctx.obj = CLIState(
         mode=resolved_mode,
         reports_dir=resolved_reports,
         allowed_ext=resolved_ext,
         max_file_bytes=resolved_max,
-        verbose=verbose,
+        verbose=False,  # verbose tas bort som option → sätt default
     )
 
 # -------------------- License requirement --------------------
 
 def require_license_or_exit(command_name: str):
-    """
-    Check license before running a command.
-
-    - Reads NOOR_LICENSE_KEY from the environment.
-    - Calls the license server via check_and_consume.
-    - Exits with a clear message if anything is wrong.
-    """
-    license_key = (os.getenv("NOOR_LICENSE_KEY") or "").strip()
+    license_key = os.getenv("NOOR_LICENSE_KEY") or ""
     if not license_key:
-        click.echo("🔐 Noorlytics requires a license key. Set NOOR_LICENSE_KEY (free tier: 5 runs).")
-        raise SystemExit(2)  # ⬅️ VIKTIGT: vi AVSLUTAR här, inget HTTP-anrop
+        click.echo("🔐 Set NOOR_LICENSE_KEY to run Noorlytics (free: 10 runs).")
+        raise SystemExit(2)
 
-    product = f"noor-cli:{command_name}"
-    res = check_and_consume(license_key, product=product, consume=True)
+    # --- Health check BEFORE consuming anything ---
+    health = ensure_license_server_up()
+    if not health.get("ok"):
+        click.echo(f"❌ Could not reach license server: {health.get('error', 'unreachable')}")
+        raise SystemExit(2)
+    # ---------------------------------------------------
+
+    # FIX: product=command_name (tidigare: product=product → NameError)
+    res = check_and_consume(license_key, product=command_name, consume=True)
 
     if not res.get("ok"):
         error = res.get("error", "license_error")
@@ -197,6 +184,7 @@ def require_license_or_exit(command_name: str):
             click.echo(f"❌ License server returned an error: {error}")
         else:
             click.echo(f"❌ License check failed: {error} (plan={plan}, remaining={remaining})")
+
         raise SystemExit(3)
 
     plan = res.get("plan") or "unknown"
@@ -205,7 +193,6 @@ def require_license_or_exit(command_name: str):
         click.echo(f"✅ License OK ({plan}). Remaining runs: {remaining}")
     else:
         click.echo(f"✅ License OK ({plan}).")
-
 
 # -------------------- Commands --------------------
 
@@ -363,6 +350,35 @@ def refactor_cmd(state: CLIState, path: Path):
             out = state.reports_dir / f"{fpath.name}.refactor.md"
             _save_and_print(md, out, header=fpath.name)
             prog.advance(t)
+
+@cli.command("license-status")
+def license_status_cmd():
+    """Show license health, plan and remaining runs without consuming."""
+    status = get_license_status()
+
+    if not status.get("ok"):
+        error = status.get("error", "unknown_error")
+
+        if error == "no_license_key":
+            click.echo("🔐 No license key found. Set NOOR_LICENSE_KEY in your environment or .env file.")
+        elif error == "license_server_timeout":
+            click.echo("❌ License server did not respond in time.")
+        elif error == "license_server_unreachable":
+            click.echo("❌ Could not reach the license server.")
+        elif error.startswith("http "):
+            click.echo(f"❌ License server returned an error: {error}")
+        else:
+            click.echo(f"❌ License status error: {error}")
+        return
+
+    plan = status.get("plan", "unknown")
+    remaining = status.get("remaining")
+    click.echo(f"🟢 License status:")
+    click.echo(f"   Plan: {plan}")
+    if remaining is not None:
+        click.echo(f"   Remaining runs: {remaining}")
+    else:
+        click.echo("   Remaining runs: unlimited")
 
 
 # -------------------- Entrypoint --------------------

@@ -5,6 +5,8 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv, find_dotenv
 
+load_dotenv(find_dotenv(), override=True)
+
 def _as_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -19,7 +21,6 @@ class Settings:
     num_ctx: int = int(os.getenv("NOOR_NUM_CTX", "4096"))
 
     # Ollama / server
-    load_dotenv(find_dotenv(), override=True)
     ollama_api_url: str = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/chat")
     ollama_base: str = os.getenv("OLLAMA_BASE", "http://localhost:11434")
     http_timeout: float = float(os.getenv("NOOR_HTTP_TIMEOUT", "60"))

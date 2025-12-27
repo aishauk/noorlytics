@@ -2,37 +2,62 @@ import hashlib, json, os, platform, time
 import sys
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from socket import timeout as SocketTimeout
 
 LICENSE_SERVER = os.getenv("NOOR_LICENSE_SERVER", "https://noor-license.onrender.com")
 TIMEOUT = 5
+
+
+def ensure_license_server_up(timeout: int = 3) -> dict:
+    """Lightweight health check so we fail fast before consuming a run.
+
+    Returns a dict with at least {"ok": bool, "error"|"status": str}.
+    """
+    url = f"{LICENSE_SERVER}/health"
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8") or "{}"
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {}
+            return {"ok": True, "status": data.get("status", "unknown")}
+    except HTTPError as e:
+        return {"ok": False, "error": f"http {e.code}"}
+    except (URLError, TimeoutError, SocketTimeout):
+        # DNS-fel, ingen kontakt eller servern svarar inte i tid
+        return {"ok": False, "error": "license_server_timeout"}
+
 
 def device_fingerprint() -> str:
     base = f"{platform.system()}|{platform.node()}|{platform.processor()}"
     return hashlib.sha256(base.encode()).hexdigest()[:16]
 
 def check_and_consume(license_key: str, product: str, consume: bool = True) -> dict:
-    license_key = (license_key or "").strip()
-    if not license_key:
-        return {"ok": False, "error": "no_license_key"}
-
     payload = {
-        "license_key": license_key,
+        "license_key": license_key.strip(),
         "product": product,
         "device": device_fingerprint(),
         "consume": consume,
         "ts": int(time.time()),
         "version": os.getenv("NOOR_VERSION", "0.1.0"),
     }
-    
     data = json.dumps(payload).encode("utf-8")
-    req = Request(f"{LICENSE_SERVER}/issue", data=data, headers={"Content-Type":"application/json"}, method="POST")
+    req = Request(
+        f"{LICENSE_SERVER}/issue",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
         with urlopen(req, timeout=TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         return {"ok": False, "error": f"http {e.code}"}
-    except URLError:
-        return {"ok": False, "error": "license_server_unreachable"}
+    except (URLError, TimeoutError, SocketTimeout):
+        return {"ok": False, "error": "license_server_timeout"}
+
 
 def require_valid_license(license_key: str, product: str):
     """
@@ -97,3 +122,19 @@ def require_license_or_exit(product: str, license_key: str | None = None):
         print(f"✅ License OK (plan={plan}, remaining≈{remaining})")
     else:
         print(f"✅ License OK (plan={plan})")
+
+def get_license_status() -> dict:
+    """Return license status without consuming a run."""
+    key = os.getenv("NOOR_LICENSE_KEY", "").strip()
+    if not key:
+        return {"ok": False, "error": "no_license_key"}
+
+    # Health check
+    health = ensure_license_server_up()
+    if not health.get("ok"):
+        return {"ok": False, "error": health.get("error")}
+
+    # Ask for status (consume=False)
+    result = check_and_consume(key, product="status", consume=False)
+
+    return result
