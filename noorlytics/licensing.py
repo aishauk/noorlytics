@@ -4,17 +4,22 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from socket import timeout as SocketTimeout
 
+from .logger import log_to_console
+
 LICENSE_SERVER = os.getenv("NOOR_LICENSE_SERVER", "https://noor-license.onrender.com")
-TIMEOUT = 5
+TIMEOUT = float(os.getenv("NOOR_LICENSE_TIMEOUT", "15"))
 
 
-def ensure_license_server_up(timeout: int = 3) -> dict:
+def ensure_license_server_up(timeout: float | None = None) -> dict:
     """Lightweight health check so we fail fast before consuming a run.
 
     Returns a dict with at least {"ok": bool, "error"|"status": str}.
     """
+    if timeout is None:
+        timeout = TIMEOUT
     url = f"{LICENSE_SERVER}/health"
     req = Request(url, method="GET")
+    log_to_console(f"🔎 License server health check: {url} (timeout={timeout}s)")
     try:
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8") or "{}"
@@ -26,7 +31,7 @@ def ensure_license_server_up(timeout: int = 3) -> dict:
     except HTTPError as e:
         return {"ok": False, "error": f"http {e.code}"}
     except (URLError, TimeoutError, SocketTimeout):
-        # DNS-fel, ingen kontakt eller servern svarar inte i tid
+        log_to_console(f"⚠️ License server health check timed out after {timeout}s")
         return {"ok": False, "error": "license_server_timeout"}
 
 
@@ -50,12 +55,14 @@ def check_and_consume(license_key: str, product: str, consume: bool = True) -> d
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    log_to_console(f"🔐 Sending license request to {LICENSE_SERVER}/issue (timeout={TIMEOUT}s)")
     try:
         with urlopen(req, timeout=TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         return {"ok": False, "error": f"http {e.code}"}
     except (URLError, TimeoutError, SocketTimeout):
+        log_to_console(f"⚠️ License server did not respond within {TIMEOUT}s")
         return {"ok": False, "error": "license_server_timeout"}
 
 
