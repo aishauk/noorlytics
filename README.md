@@ -68,6 +68,32 @@ Commands:
 - Reports are saved to `reports/` as Markdown and JSON files.
 - Suggestions and findings are also printed to the console.
 
+## 🔧 Configuration
+
+All settings are configured via environment variables (loaded from `.env`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `NOOR_LICENSE_KEY` | — | **Required.** Your product license key. Free plan allows 10 runs. |
+| `NOOR_MODE` | — | LLM backend: `ollama` or `openai`. Overridden by the `--mode` CLI flag. |
+| `COMPLIANCE_MODE` | `true` | When `true`, suppresses all debug/log output. Set to `false` for verbose diagnostics. |
+| `OPENAI_API_KEY` | `""` | OpenAI API key, required when using `--mode=openai`. |
+| `NOOR_MODEL` | `mistral:latest` | Ollama model name to use for generation. |
+| `NOOR_NUM_CTX` | `4096` | Context window size (tokens) passed to Ollama. |
+| `OLLAMA_BASE` | `http://localhost:11434` | Base URL of the Ollama server. |
+| `OLLAMA_API_URL` | `http://localhost:11434/api/chat` | Full URL for the Ollama chat API endpoint. |
+| `NOOR_HTTP_TIMEOUT` | `60` | Timeout in seconds for LLM HTTP calls. |
+| `NOOR_KEEP_ALIVE` | `5m` | How long Ollama keeps the model loaded in memory between requests. |
+| `NOOR_TEMP_ANALYZE` | `0.0` | LLM temperature for analysis commands (lower = more deterministic). |
+| `NOOR_TEMP_REFACTOR` | `0.0` | LLM temperature for refactor/suggestion commands. |
+| `NOOR_ANALYZE_NUM_PREDICT` | `512` | Max tokens the LLM can generate for analysis and test-generation responses. |
+| `NOOR_REFACTOR_NUM_PREDICT` | `1024` | Max tokens the LLM can generate for refactor/suggestion responses. |
+| `NOOR_MAX_CHUNK_LINES` | `120` | Max lines per chunk when splitting large files for LLM processing. |
+| `NOOR_CHUNK_OVERLAP` | `20` | Overlapping lines between consecutive chunks to preserve context. |
+| `NOOR_REPORTS_DIR` | `reports` | Directory where all output files (`.md`, `.json`) are saved. |
+| `NOOR_MAX_FILE_BYTES` | `100000` | Files larger than this (in bytes) are skipped during directory scans. |
+| `NOOR_ALLOWED_EXT` | `.py` | Comma-separated file extensions to include in scans (e.g. `.py,.js`). |
+
 ## 🛡 Compliance
 - With `--mode=ollama`, all inference runs locally, compliant with secure/restricted environments.
 - `.env` support for managing API keys and configuration.

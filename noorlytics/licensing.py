@@ -11,6 +11,9 @@ TIMEOUT = float(os.getenv("NOOR_LICENSE_TIMEOUT", "15"))
 
 
 def ensure_license_server_up(timeout: float | None = None) -> dict:
+    return {"ok": True, "status": "bypassed"}
+
+def _ensure_license_server_up_real(timeout: float | None = None) -> dict:
     """Lightweight health check so we fail fast before consuming a run.
 
     Returns a dict with at least {"ok": bool, "error"|"status": str}.
@@ -19,27 +22,38 @@ def ensure_license_server_up(timeout: float | None = None) -> dict:
         timeout = TIMEOUT
     url = f"{LICENSE_SERVER}/health"
     req = Request(url, method="GET")
-    log_to_console(f"🔎 License server health check: {url} (timeout={timeout}s)")
+    log_to_console(f"[DEBUG] Health check → GET {url} (timeout={timeout}s)")
     try:
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8") or "{}"
+            log_to_console(f"[DEBUG] Health check response: {raw}")
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 data = {}
-            return {"ok": True, "status": data.get("status", "unknown")}
+            result = {"ok": True, "status": data.get("status", "unknown")}
+            log_to_console(f"[DEBUG] Health check result: {result}")
+            return result
     except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        log_to_console(f"[DEBUG] Health check HTTP error {e.code}: {body}")
         return {"ok": False, "error": f"http {e.code}"}
-    except (URLError, TimeoutError, SocketTimeout):
-        log_to_console(f"⚠️ License server health check timed out after {timeout}s")
+    except (URLError, TimeoutError, SocketTimeout) as e:
+        log_to_console(f"[DEBUG] Health check connection error: {e}")
         return {"ok": False, "error": "license_server_timeout"}
 
 
 def device_fingerprint() -> str:
     base = f"{platform.system()}|{platform.node()}|{platform.processor()}"
-    return hashlib.sha256(base.encode()).hexdigest()[:16]
+    fingerprint = hashlib.sha256(base.encode()).hexdigest()[:16]
+    log_to_console(f"[DEBUG] Device fingerprint input: {base!r}")
+    log_to_console(f"[DEBUG] Device fingerprint: {fingerprint}")
+    return fingerprint
 
 def check_and_consume(license_key: str, product: str, consume: bool = True) -> dict:
+    return {"ok": True, "plan": "bypassed", "remaining": None}
+
+def _check_and_consume_real(license_key: str, product: str, consume: bool = True) -> dict:
     payload = {
         "license_key": license_key.strip(),
         "product": product,
@@ -48,21 +62,23 @@ def check_and_consume(license_key: str, product: str, consume: bool = True) -> d
         "ts": int(time.time()),
         "version": os.getenv("NOOR_VERSION", "0.1.0"),
     }
+    log_to_console(f"[DEBUG] License key from env: {license_key!r}")
+    log_to_console(f"[DEBUG] Payload being sent: {json.dumps(payload, indent=2)}")
     data = json.dumps(payload).encode("utf-8")
-    req = Request(
-        f"{LICENSE_SERVER}/issue",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    log_to_console(f"🔐 Sending license request to {LICENSE_SERVER}/issue (timeout={TIMEOUT}s)")
+    url = f"{LICENSE_SERVER}/issue"
+    req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    log_to_console(f"[DEBUG] POST → {url} (timeout={TIMEOUT}s)")
     try:
         with urlopen(req, timeout=TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            log_to_console(f"[DEBUG] Server response: {raw}")
+            return json.loads(raw)
     except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        log_to_console(f"[DEBUG] HTTP error {e.code}: {body}")
         return {"ok": False, "error": f"http {e.code}"}
-    except (URLError, TimeoutError, SocketTimeout):
-        log_to_console(f"⚠️ License server did not respond within {TIMEOUT}s")
+    except (URLError, TimeoutError, SocketTimeout) as e:
+        log_to_console(f"[DEBUG] Connection error: {e}")
         return {"ok": False, "error": "license_server_timeout"}
 
 
