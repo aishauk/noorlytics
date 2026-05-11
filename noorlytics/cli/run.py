@@ -17,7 +17,6 @@ from noorlytics.analyze_dependencies import (
     render_vulns_cli,
 )
 from noorlytics.add_tests import generate_unit_tests, render_tests_cli
-from noorlytics.licensing import check_and_consume, ensure_license_server_up, get_license_status
 
 
 # -------------------- Constants --------------------
@@ -149,51 +148,6 @@ def cli(ctx: click.Context, mode: Optional[str]):
         verbose=False,  # verbose tas bort som option → sätt default
     )
 
-# -------------------- License requirement --------------------
-
-def require_license_or_exit(command_name: str):
-    license_key = os.getenv("NOOR_LICENSE_KEY") or ""
-    if not license_key:
-        click.echo("🔐 Set NOOR_LICENSE_KEY to run Noorlytics (free: 10 runs).")
-        raise SystemExit(2)
-
-    # --- Health check BEFORE consuming anything ---
-    health = ensure_license_server_up()
-    if not health.get("ok"):
-        click.echo(f"❌ Could not reach license server: {health.get('error', 'unreachable')}")
-        raise SystemExit(2)
-    # ---------------------------------------------------
-
-    # FIX: product=command_name (tidigare: product=product → NameError)
-    res = check_and_consume(license_key, product=command_name, consume=True)
-
-    if not res.get("ok"):
-        error = res.get("error", "license_error")
-        remaining = res.get("remaining")
-        plan = res.get("plan", "unknown")
-
-        if error == "free_runs_exhausted":
-            click.echo("❌ Free plan limit reached (0 runs remaining). Upgrade to Pro to continue.")
-        elif error == "device_mismatch":
-            click.echo("❌ This license key is already bound to a different machine.")
-        elif error == "license_server_unreachable":
-            click.echo("❌ Could not reach the license server. Check your internet connection and try again.")
-        elif error == "license_server_timeout":
-            click.echo("❌ License server did not respond in time. Please try again in a few seconds.")
-        elif error.startswith("http "):
-            click.echo(f"❌ License server returned an error: {error}")
-        else:
-            click.echo(f"❌ License check failed: {error} (plan={plan}, remaining={remaining})")
-
-        raise SystemExit(3)
-
-    plan = res.get("plan") or "unknown"
-    remaining = res.get("remaining")
-    if remaining is not None:
-        click.echo(f"✅ License OK ({plan}). Remaining runs: {remaining}")
-    else:
-        click.echo(f"✅ License OK ({plan}).")
-
 # -------------------- Commands --------------------
 
 @cli.command("analyze")
@@ -201,7 +155,6 @@ def require_license_or_exit(command_name: str):
 @click.pass_obj
 def analyze_cmd(state: CLIState, path: Path):
     """Analyze technical debt in a file or directory."""
-    require_license_or_exit("analyze")
     client = state.ensure_client()
 
     files = (
@@ -228,7 +181,6 @@ def analyze_cmd(state: CLIState, path: Path):
 @click.pass_obj
 def suggest_cmd(state: CLIState, path: Path):
     """Generate improvement and refactoring suggestions."""
-    require_license_or_exit("suggest")
     client = state.ensure_client()
 
     files = (
@@ -259,7 +211,6 @@ def suggest_cmd(state: CLIState, path: Path):
 @click.pass_obj
 def add_tests_cmd(state: CLIState, path: Path, lang: str):
     """Generate unit test stubs for a file or directory."""
-    require_license_or_exit("add-tests")
     candidates = (
         [p for p in path.rglob("*")
          if p.is_file() and p.suffix.lower() in state.allowed_ext and not any(part in DEFAULT_IGNORE_DIRS for part in p.parts)]
@@ -288,9 +239,6 @@ def add_tests_cmd(state: CLIState, path: Path, lang: str):
 @click.pass_obj
 def analyze_deps_cmd(state: CLIState, manifest: Path):
     """Analyze a dependency manifest (requirements.txt, pyproject.toml, package.json)."""
-    # Licenskontroll
-    require_license_or_exit("analyze-deps")
-
     client = state.ensure_client()
     result = analyze_dependencies_file(manifest, client)
 
@@ -330,7 +278,6 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
 @click.pass_obj
 def refactor_cmd(state: CLIState, path: Path):
     """Create AI-assisted refactor plans in Markdown."""
-    require_license_or_exit("refactor")
     client = state.ensure_client()
 
     files = (
@@ -350,36 +297,6 @@ def refactor_cmd(state: CLIState, path: Path):
             out = state.reports_dir / f"{fpath.name}.refactor.md"
             _save_and_print(md, out, header=fpath.name)
             prog.advance(t)
-
-@cli.command("license-status")
-def license_status_cmd():
-    """Show license health, plan and remaining runs without consuming."""
-    status = get_license_status()
-
-    if not status.get("ok"):
-        error = status.get("error", "unknown_error")
-
-        if error == "no_license_key":
-            click.echo("🔐 No license key found. Set NOOR_LICENSE_KEY in your environment or .env file.")
-        elif error == "license_server_timeout":
-            click.echo("❌ License server did not respond in time.")
-        elif error == "license_server_unreachable":
-            click.echo("❌ Could not reach the license server.")
-        elif error.startswith("http "):
-            click.echo(f"❌ License server returned an error: {error}")
-        else:
-            click.echo(f"❌ License status error: {error}")
-        return
-
-    plan = status.get("plan", "unknown")
-    remaining = status.get("remaining")
-    click.echo(f"🟢 License status:")
-    click.echo(f"   Plan: {plan}")
-    if remaining is not None:
-        click.echo(f"   Remaining runs: {remaining}")
-    else:
-        click.echo("   Remaining runs: unlimited")
-
 
 # -------------------- Entrypoint --------------------
 
