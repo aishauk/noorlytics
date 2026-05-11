@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Noorlytics — AI-powered technical debt analyzer (local Ollama or OpenAI)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 authors = [{ name = "Aisha Kujovic Ugljanin" }]
 keywords = ["technical debt", "ai", "cli", "code quality", "refactoring"]
 classifiers = [
