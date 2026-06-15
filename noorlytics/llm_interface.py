@@ -1,7 +1,12 @@
 # noorlytics/llm_interface.py
+# Unified interface for LLM interactions (OpenAI and Ollama).
+# - Configured via settings.py (model choice, temps, timeouts).
+# - Provides high-level methods for analysis, refactoring suggestions, and test generation.
+# - Includes a simple CLI Markdown renderer with section headers.
 from __future__ import annotations
 
 import json
+import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -87,31 +92,88 @@ class LLMClient:
                     **({"num_predict": max_tokens} if max_tokens else {}),
                 },
             }
-            r = net.session().post(self.ollama_api_url, json=payload, timeout=self.http_timeout)
-            r.raise_for_status()
+
+            try:
+                r = net.session().post(self.ollama_api_url, json=payload, timeout=self.http_timeout)
+                r.raise_for_status()
+            except requests.exceptions.ConnectionError:
+                raise RuntimeError(
+                    "Could not connect to Ollama.\n\n"
+                    f"Noorlytics tried to reach: {self.ollama_api_url}\n\n"
+                    "Start Ollama with:\n"
+                    "  ollama serve\n\n"
+                    "Then make sure your model is installed:\n"
+                    f"  ollama pull {self.model}\n\n"
+                    "Or use OpenAI mode:\n"
+                    "  noor --mode openai analyze <path>"
+                )
+            except requests.exceptions.Timeout:
+                raise RuntimeError(
+                    "Ollama did not respond in time.\n\n"
+                    f"Current timeout: {self.http_timeout}s\n\n"
+                    "Try increasing it:\n"
+                    "  export NOOR_HTTP_TIMEOUT=300\n\n"
+                    "Or reduce output size:\n"
+                    "  export NOOR_ANALYZE_NUM_PREDICT=160"
+                )
+            except requests.exceptions.HTTPError as e:
+                raise RuntimeError(
+                    "Ollama returned an HTTP error.\n\n"
+                    f"URL: {self.ollama_api_url}\n"
+                    f"Error: {e}"
+                )
+
             data = r.json()
             if "message" in data and isinstance(data["message"], dict):
                 return data["message"].get("content", "")
             return data.get("response", "")
-        else:
-            completion = openai.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return completion.choices[0].message.content or ""
+
+        completion = openai.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return completion.choices[0].message.content or ""
 
     # ----- High-level helpers -----
 
     def analyze_text(self, filename: str, content: str) -> str:
         # Slightly opinionated prompt to keep headings stable for the CLI renderer.
         sys = (
-            "You analyze code for technical debt, risks, smells, and modernization opportunities. "
-            "Return concise Markdown with these H2 headings in this exact order:\n"
-            "## Summary\n## Findings\n## Impact\n## Suggested Actions\n"
-            "Use bullets for lists. Keep lines short."
+            "You are Noorlytics, a senior engineering risk analyst.\n"
+            "Your job is to identify what matters most and what should be fixed first.\n\n"
+
+            "Analyze the code for production bugs, data correctness, security/privacy risks, performance, reliability, and maintainability.\n\n"
+
+            "Return concise Markdown with EXACTLY these H2 headings in this order:\n"
+            "## Executive Summary\n"
+            "## Top Risks\n"
+            "## Impact & Risk\n"
+            "## Highest-ROI Recommendations\n\n"
+
+            "Rules:\n"
+            "- Be specific to the provided code; avoid generic advice.\n"
+            "- Prefer fewer, higher-value findings over long lists.\n"
+            "- Do not invent behavior not visible in the code. If uncertain, state assumptions.\n\n"
+
+            "In ## Top Risks:\n"
+            "- List up to 5 risks, ordered by priority.\n"
+            "- Use this format:\n"
+            "  - [P1 High] Short title\n"
+            "    - Severity: Critical/High/Medium/Low\n"
+            "    - Likelihood: High/Medium/Low\n"
+            "    - Affected area: ...\n"
+            "    - Why it matters: ...\n\n"
+
+            "In ## Impact & Risk:\n"
+            "- Explain concrete user, system, and developer impacts.\n\n"
+
+            "In ## Highest-ROI Recommendations:\n"
+            "- Provide the top 1–3 recommended fixes ranked by ROI.\n"
+            "- For each recommendation include: What to change; Estimated effort (Small/Medium/Large); Expected impact.\n"
         )
+        
         user = f"File: {filename}\n\n```text\n{content}\n```"
         return self.chat(
             [
@@ -245,4 +307,3 @@ def _relpath_for_demo(p: Path, base: Optional[Path] = None) -> str:
     # Fallback: keep only the tail
     parts = p.parts
     return str(Path(*parts[-2:]))
-

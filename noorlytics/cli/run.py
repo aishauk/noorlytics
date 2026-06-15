@@ -16,7 +16,7 @@ from noorlytics.analyze_dependencies import (
     render_notes_cli,
     render_vulns_cli,
 )
-from noorlytics.add_tests import generate_unit_tests, render_tests_cli
+from noorlytics.add_tests import generate_unit_tests, render_tests_cli, _detect_language_from_extension
 
 # -------------------- Constants --------------------
 
@@ -204,9 +204,9 @@ def suggest_cmd(state: CLIState, path: Path):
 @cli.command("add-tests")
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--lang", "--language", "lang",
-              type=click.Choice(["python", "js", "ts", "java", "go"]),
-              default="python",
-              help="Programming language hint for the test generator.")
+              type=click.Choice(["python", "js", "ts", "java", "go", "csharp", "ruby", "cpp", "c", "php"]),
+              default=None,
+              help="Programming language. If omitted, auto-detects from file extension.")
 @click.pass_obj
 def add_tests_cmd(state: CLIState, path: Path, lang: str):
     """Generate unit test stubs for a file or directory."""
@@ -225,7 +225,9 @@ def add_tests_cmd(state: CLIState, path: Path, lang: str):
         t = prog.add_task("run", total=len(candidates))
         for fpath in candidates:
             try:
-                out_path = generate_unit_tests(fpath, mode=state.mode, language_hint=lang)
+                # Auto-detect language if not provided
+                language_hint = lang or _detect_language_from_extension(fpath)
+                out_path = generate_unit_tests(fpath, mode=state.mode, language_hint=language_hint)
                 render_tests_cli(out_path)
             except Exception as e:
                 click.echo(click.style(f"❌  Failed to generate tests for {fpath}: {e}", fg="red"))

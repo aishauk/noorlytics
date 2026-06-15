@@ -3,7 +3,6 @@ import os
 from noorlytics.analyze_dependencies import analyze_dependencies
 from noorlytics.analyze_requirements import analyze_requirements
 from noorlytics.license_audit import audit_licenses
-from noorlytics.llm_interface import suggest_refactorings_realtime, apply_suggestion_to_code
 
 
 def run_analysis(path: str, mode: str = "ollama"):

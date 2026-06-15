@@ -41,7 +41,8 @@ class Settings:
 
     # CLI collection
     max_file_bytes: int = int(os.getenv("NOOR_MAX_FILE_BYTES", "100000"))
-    allowed_ext: tuple[str, ...] = tuple(os.getenv("NOOR_ALLOWED_EXT", ".py").split(","))
+    # Default allowed extensions for CLI collection. Include C# (.cs) by default.
+    allowed_ext: tuple[str, ...] = tuple(os.getenv("NOOR_ALLOWED_EXT", ".py,.cs").split(","))
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

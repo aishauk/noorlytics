@@ -21,26 +21,25 @@ from noorlytics.settings import get_settings
 from noorlytics.llm_interface import LLMClient
 
 
-# ---------- strict prompt ----------
+# ---------- general test prompt ----------
 
-STRICT_TEST_PROMPT = """You generate executable unit tests ONLY.
+GENERAL_TEST_PROMPT = """You generate executable unit tests ONLY.
 Requirements:
-- Framework: {framework} (default pytest).
-- Output: ONE Python module, **code only**. No markdown, no comments outside Python.
+- Output: **code only**. No markdown, no comments outside the code.
 - Do NOT repeat the source code. Do not explain.
-- Import the module under test as `uut`; assume the following lines already exist at the top of the file:
-
-    import importlib.util, pathlib
-    _SRC = (pathlib.Path(__file__).resolve().parent / r"{rel_path}")
-    _SPEC = importlib.util.spec_from_file_location("{module_name}", _SRC)
-    uut = importlib.util.module_from_spec(_SPEC)
-    _SPEC.loader.exec_module(uut)
-
+- Detect the language and use the idiomatic testing framework for that language:
+  * Python: pytest (use `uut` import harness if provided)
+  * JavaScript/TypeScript: Jest or Vitest
+  * Java: JUnit
+  * C#: NUnit or xUnit
+  * Go: Go testing package
+  * Ruby: RSpec or Minitest
 - Write fast, deterministic tests (no I/O, no network, no sleeps, no infinite loops).
-- Name tests `test_*`. Prefer AAA pattern and focused assertions.
-- If functionality is hard to exercise safely (e.g., GUI/main loop), write smoke tests that import, create objects, and assert invariants without starting loops.
+- Use idiomatic test naming (test_*, describe/it, TestXxx, etc. depending on language).
+- Prefer AAA pattern and focused assertions.
+- If functionality is hard to exercise safely (e.g., async/GUI/main loops), write smoke tests that verify the module loads and key exports/functions exist.
 
-Produce ONLY Python code for tests below.
+Produce ONLY code in the detected language below.
 """
 
 
@@ -99,6 +98,26 @@ def _compiles(code: str) -> bool:
         return False
 
 
+def _detect_language_from_extension(path: Path) -> str:
+    """Auto-detect language from file extension."""
+    ext_map = {
+        ".py": "python",
+        ".js": "js",
+        ".ts": "ts",
+        ".jsx": "js",
+        ".tsx": "ts",
+        ".java": "java",
+        ".cs": "csharp",
+        ".go": "go",
+        ".rb": "ruby",
+        ".cpp": "cpp",
+        ".c": "c",
+        ".h": "c",
+        ".php": "php",
+    }
+    return ext_map.get(path.suffix.lower(), "python")
+
+
 def _fallback_pytest_skeleton(pub_funcs: List[str]) -> str:
     lines = [
         "def test_module_imports():",
@@ -151,13 +170,26 @@ def generate_unit_tests(path: Path, mode: str | None = None, language_hint: str 
     except Exception:  # CHANGED
         rel_from_reports = str(path.resolve())  # CHANGED
 
-    # LLM: strict prompt → code only
-    system = STRICT_TEST_PROMPT.format(
-        framework="pytest" if language_hint.lower() == "python" else "pytest",
-        rel_path=rel_from_reports,
-        module_name=path.stem,
-    )
-    user = f"Source file: {path.name}\n\n```python\n{src_text}\n```"
+    # Determine if this is Python for the import harness
+    is_python = path.suffix.lower() == ".py"
+    
+    # LLM: general prompt → code only
+    if is_python:
+        # Python gets the special import harness
+        system = GENERAL_TEST_PROMPT + f"""
+
+For Python files specifically, assume the following import harness already exists at the top:
+
+    import importlib.util, pathlib
+    _SRC = (pathlib.Path(__file__).resolve().parent / r"{rel_from_reports}")
+    _SPEC = importlib.util.spec_from_file_location("{path.stem}", _SRC)
+    uut = importlib.util.module_from_spec(_SPEC)
+    _SPEC.loader.exec_module(uut)
+"""
+    else:
+        system = GENERAL_TEST_PROMPT
+    
+    user = f"Source file: {path.name}\n\n```\n{src_text}\n```"
 
     raw = client.chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -169,11 +201,11 @@ def generate_unit_tests(path: Path, mode: str | None = None, language_hint: str 
 
     # Build final test module
     header = _make_header_banner(path, language_hint, getattr(client, "mode", None))
-    harness = _import_harness(rel_from_reports, path.stem)
+    harness = _import_harness(rel_from_reports, path.stem) if is_python else ""
     tests_code = header + harness + body.strip() + "\n"
 
-    # Validate; fallback if needed
-    if not _looks_like_tests(tests_code) or not _compiles(tests_code):
+    # Validate; fallback only for Python files
+    if is_python and (not _looks_like_tests(tests_code) or not _compiles(tests_code)):
         pub = _public_functions_from_source(src_text)
         skeleton = _fallback_pytest_skeleton(pub)
         tests_code = header + harness + skeleton
@@ -229,7 +261,6 @@ def render_tests_cli(out_path: Path) -> None:
 
         tbl = Table.grid(padding=(0, 2))
         tbl.add_row("📄 File", demo_path)
-        tbl.add_row("🧪 Style", style)
         tbl.add_row("✅ Contains tests", "yes" if has_tests else "fallback")
         console.print(tbl)
         console.print()  # blank line
@@ -245,11 +276,6 @@ def render_tests_cli(out_path: Path) -> None:
         console.print()
         console.print(Syntax(preview, "python", line_numbers=True, start_line=1))
         console.print(Rule(style="cyan"))
-
-
-        # --- Next step box ---
-        cmd = f"pytest -q {demo_path}" if style == "pytest" else f"python -m unittest {demo_path}"
-        console.print(Panel.fit(f"Next step:\n[bold]{cmd}[/bold]", border_style="cyan"))
         console.print()  # blank line
 
     except Exception:
