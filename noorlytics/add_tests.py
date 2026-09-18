@@ -37,7 +37,15 @@ Requirements:
 - Write fast, deterministic tests (no I/O, no network, no sleeps, no infinite loops).
 - Use idiomatic test naming (test_*, describe/it, TestXxx, etc. depending on language).
 - Prefer AAA pattern and focused assertions.
-- If functionality is hard to exercise safely (e.g., async/GUI/main loops), write smoke tests that verify the module loads and key exports/functions exist.
+
+Critical quality rules:
+- **Test behavior, not just existence**: Don't just check hasattr() or that a function exists. Call the function and verify it returns correct output.
+- **Test both success and failure paths**: Include tests for error cases, exceptions, edge cases, empty inputs.
+- **Use mocking for external dependencies**: Mock network calls, file I/O, database queries using unittest.mock (Python), jest.mock (JS), etc.
+- **Use specific assertions**: Assert exact values, not just truthiness. Example: `self.assertEqual(result, expected)` not `self.assertTrue(result)`.
+- **Create fixtures/helpers for complex setup**: Build helper functions or classes (like fake objects) to simulate external dependencies.
+- **Identify and test private methods that are critical**: If a private method (_func) handles important logic (parsing, error handling), test it directly.
+- **If functionality is hard to exercise safely** (e.g., async/GUI/main loops), write focused smoke tests that verify key behavior works.
 
 Produce ONLY code in the detected language below.
 """
@@ -120,17 +128,31 @@ def _detect_language_from_extension(path: Path) -> str:
 
 def _fallback_pytest_skeleton(pub_funcs: List[str]) -> str:
     lines = [
-        "def test_module_imports():",
-        "    assert hasattr(uut, '__dict__')",
+        "import unittest",
+        "from unittest.mock import patch, MagicMock",
+        "",
+        "class TestModule(unittest.TestCase):",
+        "    def test_module_imports(self):",
+        "        \"\"\"Verify the module loads without errors.\"\"\"",
+        "        self.assertTrue(hasattr(uut, '__dict__'))",
+        "        self.assertGreater(len(dir(uut)), 0)",
         "",
     ]
-    # non-breaking sanity checks for public funcs
-    for fn in pub_funcs[:10]:
+    
+    # For each public function, create a placeholder test with better structure
+    for fn in pub_funcs[:8]:  # limit to avoid bloat
         lines += [
-            f"def test_has_function_{fn}():",
-            f"    assert hasattr(uut, '{fn}')",
+            f"    def test_{fn}_exists_and_callable(self):",
+            f"        \"\"\"Verify {fn}() exists and is callable.\"\"\"",
+            f"        self.assertTrue(hasattr(uut, '{fn}'))",
+            f"        self.assertTrue(callable(getattr(uut, '{fn}')))",
             "",
         ]
+    
+    lines.append("")
+    lines.append("if __name__ == '__main__':")
+    lines.append("    unittest.main()")
+    
     return "\n".join(lines) + "\n"
 
 
@@ -142,11 +164,51 @@ def _detect_test_style(tests_code: str) -> str:
     return "pytest"
 
 
+def _assess_test_quality(code: str) -> int:
+    """Score test quality 0-100. Lower scores indicate weak/generic tests."""
+    score = 0
+    
+    # Check for behavior testing (not just existence checks)
+    has_assertEqual = "assertEqual" in code or "assert" in code.lower()
+    if has_assertEqual:
+        score += 20
+    
+    # Check for error/edge case testing
+    has_error_tests = "assertRaises" in code or "raises" in code or "Exception" in code
+    if has_error_tests:
+        score += 15
+    
+    # Check for mocking (external dependency isolation)
+    has_mocking = "@patch" in code or "MagicMock" in code or "mock" in code.lower()
+    if has_mocking:
+        score += 20
+    
+    # Check for meaningful test names (not just "test_1")
+    test_count = len(re.findall(r"def test_[a-zA-Z_]", code))
+    if test_count > 0:
+        score += 10
+    
+    # Check for docstrings/comments (indicates understanding)
+    has_docs = '"""' in code or "'''" in code or re.search(r"#.*test", code, re.IGNORECASE)
+    if has_docs:
+        score += 10
+    
+    # Check for helper classes/fixtures (indicates sophistication)
+    has_helpers = "class " in code and "Test" not in code.split("class")[1].split(":")[ 0]
+    if has_helpers:
+        score += 25
+    
+    return min(score, 100)
+
+
+
+
+
 # ---------- public API ----------
 
 def generate_unit_tests(path: Path, mode: str | None = None, language_hint: str = "python") -> Path:
     """
-    Generate unit test stubs for the given file and write to reports/<stem>.tests.py.
+    Generate unit test stubs for the given file and write to tests/<stem>.tests.py.
     Returns the output path.
     """
     S = get_settings()
@@ -158,33 +220,65 @@ def generate_unit_tests(path: Path, mode: str | None = None, language_hint: str 
 
     # Read source & derive paths
     src_text = path.read_text(encoding="utf-8", errors="ignore")
-    out_file = S.reports_dir / f"{path.stem}.tests.py"
+    tests_dir = S.tests_dir
+    out_file = tests_dir / f"{path.stem}.tests.py"
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- compute path from reports/ to the source file (for the import harness) ---
-    # Minimal fix: use os.path.relpath against the reports dir; fallback to absolute.
-    # This avoids ValueError: "is not in the subpath of '/.../reports'".
-    import os  # CHANGED
-    try:  # CHANGED
-        rel_from_reports = os.path.relpath(path.resolve(), S.reports_dir.resolve())  # CHANGED
-    except Exception:  # CHANGED
-        rel_from_reports = str(path.resolve())  # CHANGED
+    # --- compute path from tests/ to the source file (for the import harness) ---
+    # Minimal fix: use os.path.relpath against the tests dir; fallback to absolute.
+    # This avoids ValueError: "is not in the subpath of '/.../tests'".
+    import os
+    try:
+        rel_from_tests = os.path.relpath(path.resolve(), tests_dir.resolve())
+    except Exception:
+        rel_from_tests = str(path.resolve())
 
     # Determine if this is Python for the import harness
     is_python = path.suffix.lower() == ".py"
     
     # LLM: general prompt → code only
     if is_python:
-        # Python gets the special import harness
+        # Python gets the special import harness + enhanced guidance
         system = GENERAL_TEST_PROMPT + f"""
 
-For Python files specifically, assume the following import harness already exists at the top:
+For Python files specifically:
 
+1. The import harness is already at the top of the file:
     import importlib.util, pathlib
-    _SRC = (pathlib.Path(__file__).resolve().parent / r"{rel_from_reports}")
+    _SRC = (pathlib.Path(__file__).resolve().parent / r"{rel_from_tests}")
     _SPEC = importlib.util.spec_from_file_location("{path.stem}", _SRC)
     uut = importlib.util.module_from_spec(_SPEC)
     _SPEC.loader.exec_module(uut)
+
+   Reference module functions as uut.function_name()
+
+2. Use unittest.mock.patch for external dependencies (HTTP, files, APIs).
+   Example: from unittest.mock import patch
+            @patch('requests.get')
+            def test_my_function(self, mock_get): ...
+
+3. Test both success AND failure cases:
+   - Happy path (normal inputs)
+   - Error paths (exceptions, bad data)
+   - Edge cases (empty inputs, None, large values)
+
+4. Create helper classes/functions for complex mocking:
+   class FakeResponse:
+       def __init__(self, status_code, json_data):
+           self.status_code = status_code
+           self._json = json_data
+       def json(self):
+           return self._json
+
+5. Use specific assertions:
+   - self.assertEqual(actual, expected) for exact matches
+   - self.assertIn(substring, text) for string checks
+   - self.assertRaises(ExceptionType) for error cases
+   - self.assertIsNone(), self.assertTrue(), etc. for specific checks
+
+6. Keep tests focused: one test per behavior, not one test per function.
+
+Do not use: @patch decorators require careful mocking; build fake objects instead if simpler.
 """
     else:
         system = GENERAL_TEST_PROMPT
@@ -201,14 +295,23 @@ For Python files specifically, assume the following import harness already exist
 
     # Build final test module
     header = _make_header_banner(path, language_hint, getattr(client, "mode", None))
-    harness = _import_harness(rel_from_reports, path.stem) if is_python else ""
+    harness = _import_harness(rel_from_tests, path.stem) if is_python else ""
     tests_code = header + harness + body.strip() + "\n"
 
     # Validate; fallback only for Python files
-    if is_python and (not _looks_like_tests(tests_code) or not _compiles(tests_code)):
-        pub = _public_functions_from_source(src_text)
-        skeleton = _fallback_pytest_skeleton(pub)
-        tests_code = header + harness + skeleton
+    used_fallback = False
+    quality_score = 0
+    
+    if is_python:
+        quality_score = _assess_test_quality(tests_code)
+        
+        # Use fallback if: (1) doesn't look like tests, (2) doesn't compile, or (3) very low quality
+        if not _looks_like_tests(tests_code) or not _compiles(tests_code) or quality_score < 25:
+            pub = _public_functions_from_source(src_text)
+            skeleton = _fallback_pytest_skeleton(pub)
+            tests_code = header + harness + skeleton
+            used_fallback = True
+            quality_score = _assess_test_quality(tests_code)
 
     # Write tests and meta
     out_file.write_text(tests_code, encoding="utf-8")
@@ -219,8 +322,11 @@ For Python files specifically, assume the following import harness already exist
             "backend": getattr(client, "mode", None),
             "style": _detect_test_style(tests_code),
             "has_tests": _looks_like_tests(tests_code),
+            "quality_score": quality_score,
+            "used_fallback": used_fallback,
+            "notes": "Quality score 0-100: 0-30=weak (placeholder), 30-60=acceptable, 60-100=strong" if is_python else None,
         }
-        (S.reports_dir / f"{path.stem}.tests.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        (S.tests_dir / f"{path.stem}.tests.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     except Exception:
         pass
 

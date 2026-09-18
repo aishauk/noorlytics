@@ -36,8 +36,9 @@ class Settings:
     max_chunk_lines: int = int(os.getenv("NOOR_MAX_CHUNK_LINES", "120"))
     chunk_overlap: int = int(os.getenv("NOOR_CHUNK_OVERLAP", "20"))
 
-    # IO / reports
+    # IO / reports and tests
     reports_dir: Path = Path(os.getenv("NOOR_REPORTS_DIR", "reports")).resolve()
+    tests_dir: Path = Path(os.getenv("NOOR_TESTS_DIR", "tests")).resolve()
 
     # CLI collection
     max_file_bytes: int = int(os.getenv("NOOR_MAX_FILE_BYTES", "400000"))
@@ -48,4 +49,5 @@ class Settings:
 def get_settings() -> Settings:
     s = Settings()
     s.reports_dir.mkdir(parents=True, exist_ok=True)
+    s.tests_dir.mkdir(parents=True, exist_ok=True)
     return s

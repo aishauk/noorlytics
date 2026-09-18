@@ -127,45 +127,63 @@ noor --mode=ollama analyze examples/legacyfile.py
 # Analyze a directory of supported source files
 noor --mode=ollama analyze examples/
 
-# Generate refactor suggestions
+# Generate refactor suggestions for one file
 noor --mode=ollama suggest examples/legacyfile.py
 
-# Generate unit test stubs
+# Generate refactor suggestions for entire package
+noor --mode=ollama suggest examples/
+
+# Generate unit test stubs for one file
 noor --mode=ollama add-tests examples/legacyfile.py
 
-# Analyze dependencies
-noor --mode=ollama analyze-deps examples/requirements.txt
+# Generate tests for all files in a package
+noor --mode=ollama add-tests examples/
 
-# Generate a refactor plan
+# Create refactor plan for one file
 noor --mode=ollama refactor examples/legacyfile.py
+
+# Create refactor plans for entire package
+noor --mode=ollama refactor examples/
 ```
 
 ## Command Reference
 
 `analyze`
 
-- analyzes one file or a directory of supported source files
+- analyzes a single file or entire package/directory
+- recursively finds all supported files when given a directory
 - writes versioned Markdown reports to `reports/`
+- for packages, shows progress and summary of analyzed files
 
 `suggest`
 
-- generates refactor suggestions in Markdown
-- does not modify source code
+- generates improvement and refactoring suggestions for a file or package
+- recursively finds all supported files when given a directory
+- writes versioned Markdown reports to `reports/`
+- for packages, shows progress and summary of generated suggestions
 
 `add-tests`
 
-- generates test stubs
+- generates test stubs for a single file or entire package/directory
+- recursively finds all supported files when given a directory
+- saves test files to `tests/` folder
 - most reliable for Python inputs
+- output pattern: `tests/{source_stem}.tests.py`
+- for packages, shows progress and summary of generated tests
 
 `analyze-deps`
 
-- analyzes a manifest for license risk and known vulnerabilities
-- writes a JSON report and a versioned Markdown summary
+- analyzes a single dependency manifest for license risk and known vulnerabilities
+- supports: `requirements.txt`, `pyproject.toml`, `package.json`, `packages.config`
+- writes a JSON report and a versioned Markdown summary to `reports/`
 
 `refactor`
 
-- generates a refactor plan in Markdown
-- does not automatically apply code changes
+- creates AI-assisted refactor plans for a file or package
+- recursively finds all supported files when given a directory
+- writes versioned Markdown reports to `reports/`
+- for packages, shows progress and summary of generated refactor plans
+- note: generates plans only, does not automatically apply code changes
 
 ## Configuration
 
@@ -179,17 +197,19 @@ Most useful settings:
 - `OLLAMA_API_URL`: Ollama chat endpoint
 - `NOOR_HTTP_TIMEOUT`: request timeout in seconds
 - `NOOR_KEEP_ALIVE`: how long Ollama should keep the model warm
-- `NOOR_REPORTS_DIR`: where reports are written
+- `NOOR_REPORTS_DIR`: where analysis reports are written
+- `NOOR_TESTS_DIR`: where generated test stubs are written
 - `NOOR_ALLOWED_EXT`: supported source file extensions for code analysis
 - `NOOR_MAX_FILE_BYTES`: size limit for source files scanned by the CLI
 - `COMPLIANCE_MODE`: disables file-based debug logging when `true`
 
 ## Output
 
-- Markdown reports are saved to `reports/`
+- Analysis reports are saved to `reports/`
+- Unit test stubs are saved to `tests/`
 - Re-running the same command creates a new versioned report instead of overwriting the old one
 - Each Markdown report starts with a `Generated:` timestamp
-- Dependency analysis also saves JSON output
+- Dependency analysis also saves JSON output to `reports/`
 
 ## Troubleshooting
 

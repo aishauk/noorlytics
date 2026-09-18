@@ -18,3 +18,4 @@ build/
 
 # Generated
 reports/
+tests/

@@ -171,7 +171,7 @@ def cli(ctx: click.Context, mode: Optional[str]):
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.pass_obj
 def analyze_cmd(state: CLIState, path: Path):
-    """Analyze technical debt in a file or directory."""
+    """Analyze technical debt in a file or directory (package)."""
     client = state.ensure_client()
 
     files = (
@@ -184,20 +184,55 @@ def analyze_cmd(state: CLIState, path: Path):
         click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
         raise SystemExit(2)
 
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo(click.style(f"📦 Analyzing package: {path.name}", fg="cyan"))
+        click.echo(click.style(f"   Found {len(files)} files to analyze", fg="blue"))
+        click.echo()
+
+    analyzed_count = 0
+    failed_count = 0
+
     with render_progress("Analyzing code…") as prog:
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
-            report_md = client.analyze_text(fpath.name, content)
-            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
-            _save_and_print(report_md, out, header=fpath.name)
-            prog.advance(t)
+            try:
+                report_md = client.analyze_text(fpath.name, content)
+                out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
+                
+                # For single files, show full output; for packages, show summary
+                if not (path.is_dir() and len(files) > 1):
+                    _save_and_print(report_md, out, header=fpath.name)
+                else:
+                    # Just save without rendering full output in package mode
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+                    stamped_text = f"Generated: {generated_at}\n\n{report_md.lstrip()}"
+                    out.write_text(stamped_text, encoding="utf-8")
+                    
+                    rel_path = fpath.relative_to(path)
+                    click.echo(click.style(f"   ✅ {rel_path} → {out.name}", fg="green"))
+                
+                analyzed_count += 1
+            except Exception as e:
+                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
+                failed_count += 1
+            finally:
+                prog.advance(t)
+
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo()
+        click.echo(click.style(f"✨ Analyzed {analyzed_count} file(s) in reports/ folder", fg="green"))
+        if failed_count > 0:
+            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
 
 
 @cli.command("suggest")
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.pass_obj
 def suggest_cmd(state: CLIState, path: Path):
-    """Generate improvement and refactoring suggestions."""
+    """Generate improvement and refactoring suggestions for file or package."""
     client = state.ensure_client()
 
     files = (
@@ -210,13 +245,48 @@ def suggest_cmd(state: CLIState, path: Path):
         click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
         raise SystemExit(2)
 
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo(click.style(f"📦 Generating suggestions for: {path.name}", fg="cyan"))
+        click.echo(click.style(f"   Found {len(files)} files to process", fg="blue"))
+        click.echo()
+
+    generated_count = 0
+    failed_count = 0
+
     with render_progress("Generating suggestions…") as prog:
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
-            md = client.suggest_refactors(fpath.name, content)
-            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.suggest")
-            _save_and_print(md, out, header=fpath.name)
-            prog.advance(t)
+            try:
+                md = client.suggest_refactors(fpath.name, content)
+                out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.suggest")
+                
+                # For single files, show full output; for packages, show summary
+                if not (path.is_dir() and len(files) > 1):
+                    _save_and_print(md, out, header=fpath.name)
+                else:
+                    # Just save without rendering full output in package mode
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+                    stamped_text = f"Generated: {generated_at}\n\n{md.lstrip()}"
+                    out.write_text(stamped_text, encoding="utf-8")
+                    
+                    rel_path = fpath.relative_to(path)
+                    click.echo(click.style(f"   ✅ {rel_path} → {out.name}", fg="green"))
+                
+                generated_count += 1
+            except Exception as e:
+                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
+                failed_count += 1
+            finally:
+                prog.advance(t)
+
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo()
+        click.echo(click.style(f"✨ Generated suggestions for {generated_count} file(s) in reports/ folder", fg="green"))
+        if failed_count > 0:
+            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
 
 
 @cli.command("add-tests")
@@ -227,10 +297,11 @@ def suggest_cmd(state: CLIState, path: Path):
               help="Programming language. If omitted, auto-detects from file extension.")
 @click.pass_obj
 def add_tests_cmd(state: CLIState, path: Path, lang: str):
-    """Generate unit test stubs for a file or directory."""
+    """Generate unit test stubs for a file or directory (package)."""
+    # Collect all candidate files (handles both single files and entire packages)
     candidates = (
-        [p for p in path.rglob("*")
-         if p.is_file() and p.suffix.lower() in state.allowed_ext and not any(part in DEFAULT_IGNORE_DIRS for part in p.parts)]
+        sorted([p for p in path.rglob("*")
+         if p.is_file() and p.suffix.lower() in state.allowed_ext and not any(part in DEFAULT_IGNORE_DIRS for part in p.parts)])
         if path.is_dir()
         else ([path] if (path.is_file() and path.suffix.lower() in state.allowed_ext) else [])
     )
@@ -239,6 +310,15 @@ def add_tests_cmd(state: CLIState, path: Path, lang: str):
         click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
         raise SystemExit(2)
 
+    # Summary for package mode
+    if path.is_dir() and len(candidates) > 1:
+        click.echo(click.style(f"📦 Processing package: {path.name}", fg="cyan"))
+        click.echo(click.style(f"   Found {len(candidates)} files to generate tests for", fg="blue"))
+        click.echo()
+
+    generated_count = 0
+    failed_count = 0
+
     with render_progress("Generating test stubs…") as prog:
         t = prog.add_task("run", total=len(candidates))
         for fpath in candidates:
@@ -246,11 +326,28 @@ def add_tests_cmd(state: CLIState, path: Path, lang: str):
                 # Auto-detect language if not provided
                 language_hint = lang or _detect_language_from_extension(fpath)
                 out_path = generate_unit_tests(fpath, mode=state.mode, language_hint=language_hint)
-                render_tests_cli(out_path)
+                
+                # For single files, show full output; for packages, show summary
+                if not (path.is_dir() and len(candidates) > 1):
+                    render_tests_cli(out_path)
+                else:
+                    # Just show a brief indication in package mode
+                    rel_path = fpath.relative_to(path)
+                    click.echo(click.style(f"   ✅ {rel_path} → {out_path.relative_to(out_path.parent.parent)}", fg="green"))
+                
+                generated_count += 1
             except Exception as e:
-                click.echo(click.style(f"❌  Failed to generate tests for {fpath}: {e}", fg="red"))
+                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
+                failed_count += 1
             finally:
                 prog.advance(t)
+
+    # Summary for package mode
+    if path.is_dir() and len(candidates) > 1:
+        click.echo()
+        click.echo(click.style(f"✨ Generated {generated_count} test files in tests/ folder", fg="green"))
+        if failed_count > 0:
+            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
 
 
 @cli.command("analyze-deps")
@@ -296,7 +393,7 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.pass_obj
 def refactor_cmd(state: CLIState, path: Path):
-    """Create AI-assisted refactor plans in Markdown."""
+    """Create AI-assisted refactor plans for file or package."""
     client = state.ensure_client()
 
     files = (
@@ -309,13 +406,48 @@ def refactor_cmd(state: CLIState, path: Path):
         click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
         raise SystemExit(2)
 
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo(click.style(f"📦 Creating refactor plans for: {path.name}", fg="cyan"))
+        click.echo(click.style(f"   Found {len(files)} files to process", fg="blue"))
+        click.echo()
+
+    refactored_count = 0
+    failed_count = 0
+
     with render_progress("Generating refactor plans…") as prog:
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
-            md = client.suggest_refactors(fpath.name, content)
-            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.refactor")
-            _save_and_print(md, out, header=fpath.name)
-            prog.advance(t)
+            try:
+                md = client.refactor(fpath.name, content)
+                out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.refactor")
+                
+                # For single files, show full output; for packages, show summary
+                if not (path.is_dir() and len(files) > 1):
+                    _save_and_print(md, out, header=fpath.name)
+                else:
+                    # Just save without rendering full output in package mode
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+                    stamped_text = f"Generated: {generated_at}\n\n{md.lstrip()}"
+                    out.write_text(stamped_text, encoding="utf-8")
+                    
+                    rel_path = fpath.relative_to(path)
+                    click.echo(click.style(f"   ✅ {rel_path} → {out.name}", fg="green"))
+                
+                refactored_count += 1
+            except Exception as e:
+                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
+                failed_count += 1
+            finally:
+                prog.advance(t)
+
+    # Summary for package mode
+    if path.is_dir() and len(files) > 1:
+        click.echo()
+        click.echo(click.style(f"✨ Created refactor plans for {refactored_count} file(s) in reports/ folder", fg="green"))
+        if failed_count > 0:
+            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
 
 # -------------------- Entrypoint --------------------
 

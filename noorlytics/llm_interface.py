@@ -199,26 +199,44 @@ class LLMClient:
             "## Impact & Risk\n"
             "## Highest-ROI Recommendations\n\n"
 
+            "CRITICAL ANALYSIS RULES:\n"
+            "1. BE SPECIFIC: Reference actual code patterns, function names, logic flows. Never generic advice.\n"
+            "2. IDENTIFY ROOT CAUSE: Not just symptoms. Why does this code pattern create risk?\n"
+            "3. QUANTIFY IMPACT: Describe concrete user/system/developer impact (data loss, security exposure, performance degradation).\n"
+            "4. SCORE SEVERITY: Combine likelihood (High/Med/Low) × Impact (Critical/High/Med/Low) → Priority.\n"
+            "5. PROVIDE EVIDENCE: Point to specific lines, patterns, or assumptions visible in the code.\n"
+            "6. ACTIONABLE FIX: Each risk must have a clear remediation (not just 'review code').\n\n"
+
+            "In ## Top Risks:\n"
+            "- List up to 5 risks, ordered by priority (severity × likelihood).\n"
+            "- Use this format:\n"
+            "  - [P1 Critical] Short title (specific, not generic)\n"
+            "    - Category: Security/Performance/Reliability/DataCorrectness/Maintainability\n"
+            "    - Severity: Critical/High/Medium/Low\n"
+            "    - Likelihood: High/Medium/Low\n"
+            "    - Evidence: Point to specific code pattern or function\n"
+            "    - Why it matters: Concrete consequence (data loss, security breach, performance drop)\n"
+            "    - Suggested fix: What to change and how\n\n"
+
+            "In ## Impact & Risk:\n"
+            "- Quantify real-world impact:\n"
+            "  - USER IMPACT: Data loss, security exposure, availability issues\n"
+            "  - SYSTEM IMPACT: Performance degradation, resource exhaustion, cascading failures\n"
+            "  - DEVELOPER IMPACT: Technical debt, testing difficulty, debugging complexity\n\n"
+
+            "In ## Highest-ROI Recommendations:\n"
+            "- Rank by effort-to-impact ratio (highest ROI first).\n"
+            "- For each recommendation include:\n"
+            "  - What: Specific change or refactoring\n"
+            "  - Why: How it reduces risk\n"
+            "  - Effort: Small (< 1 hour) / Medium (1-4 hours) / Large (> 4 hours)\n"
+            "  - Impact: Risk reduction, performance gain, maintainability improvement\n"
+            "  - Validation: How to test the fix works\n\n"
+
             "Rules:\n"
             "- Be specific to the provided code; avoid generic advice.\n"
             "- Prefer fewer, higher-value findings over long lists.\n"
-            "- Do not invent behavior not visible in the code. If uncertain, state assumptions.\n\n"
-
-            "In ## Top Risks:\n"
-            "- List up to 5 risks, ordered by priority.\n"
-            "- Use this format:\n"
-            "  - [P1 High] Short title\n"
-            "    - Severity: Critical/High/Medium/Low\n"
-            "    - Likelihood: High/Medium/Low\n"
-            "    - Affected area: ...\n"
-            "    - Why it matters: ...\n\n"
-
-            "In ## Impact & Risk:\n"
-            "- Explain concrete user, system, and developer impacts.\n\n"
-
-            "In ## Highest-ROI Recommendations:\n"
-            "- Provide the top 1–3 recommended fixes ranked by ROI.\n"
-            "- For each recommendation include: What to change; Estimated effort (Small/Medium/Large); Expected impact.\n"
+            "- Do not invent behavior not visible in the code. If uncertain, state assumptions.\n"
         )
         
         user = f"File: {filename}\n\n```text\n{content}\n```"
@@ -233,10 +251,61 @@ class LLMClient:
 
     def suggest_refactors(self, filename: str, content: str) -> str:
         sys = (
-            "You are a pragmatic senior engineer. Propose safe, incremental refactorings. "
-            "Output: Markdown with a checklist of concrete steps and diff-style examples."
+            "You are a pragmatic senior engineer specializing in refactoring. "
+            "Analyze code for maintainability, performance, and design improvements.\n\n"
+            "CRITICAL REFACTORING RULES:\n"
+            "1. Propose only SAFE, TESTED refactorings that preserve behavior\n"
+            "2. Provide CONCRETE BEFORE/AFTER code examples, not abstract descriptions\n"
+            "3. Explain the BENEFIT of each refactoring (e.g., reduced complexity, better testability, performance gain)\n"
+            "4. List SPECIFIC RISKS or edge cases to watch for during implementation\n"
+            "5. Organize by PRIORITY: quick wins first, then architectural improvements\n"
+            "6. Include VALIDATION STRATEGY: how to test each refactoring doesn't break functionality\n\n"
+            "Output format:\n"
+            "- Use Markdown with clear headers (##) for each refactoring\n"
+            "- Include code blocks marked with ```python or appropriate language\n"
+            "- Add a checklist (- [ ]) of implementation steps\n"
+            "- Prioritize: [HIGH] quick improvements, [MEDIUM] structural, [LOW] style"
         )
         user = f"File: {filename}\n\n```text\n{content}\n```"
+        return self.chat(
+            [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            temperature=self.temp_refactor,
+            max_tokens=self.refactor_num_predict,
+        )
+
+    def refactor(self, filename: str, content: str) -> str:
+        """Generate detailed refactoring implementation plan with step-by-step guidance."""
+        sys = (
+            "You are an expert code refactoring architect. Your goal is to create a detailed, "
+            "ACTIONABLE refactoring implementation plan that a developer can execute with confidence.\n\n"
+            "CRITICAL REFACTORING IMPLEMENTATION RULES:\n"
+            "1. START WITH ASSESSMENT: Identify code smells, complexity issues, and design problems\n"
+            "2. PROPOSE INCREMENTAL STEPS: Break large refactorings into small, testable changes\n"
+            "3. PROVIDE COMPLETE CODE: Show full BEFORE and AFTER code blocks for each change\n"
+            "4. EXPLAIN EACH CHANGE: Why this change matters + specific benefits (performance/readability/maintainability)\n"
+            "5. BACKWARDS COMPATIBILITY: Address API compatibility, deprecation paths, and migration needs\n"
+            "6. DETAILED TESTING PLAN: Specify exactly what to test and how to validate each step\n"
+            "7. ROLLBACK STRATEGY: If something breaks, how to safely revert with minimal impact\n\n"
+            "IMPLEMENTATION CHECKLIST FORMAT:\n"
+            "For EACH refactoring, provide:\n"
+            "- [HIGH/MEDIUM/LOW] priority tag\n"
+            "- Problem statement (1-2 sentences of current issue)\n"
+            "- Solution (concrete change with BEFORE/AFTER code blocks)\n"
+            "- Implementation steps as nested checklist (- [ ])\n"
+            "- Validation instructions (how to test this specific change)\n"
+            "- Estimated impact on: readability, performance, maintainability\n"
+            "- Potential breakage points or edge cases\n\n"
+            "QUALITY CRITERIA FOR REFACTORING:\n"
+            "✓ Every suggested change must be implementable by a mid-level developer\n"
+            "✓ Code examples must be copy-paste ready (no pseudocode)\n"
+            "✓ Testing strategy must be specific to the change (not generic)\n"
+            "✓ Prioritize quick wins (under 1 hour) before major refactors\n"
+            "✓ Never suggest refactoring without showing impact"
+        )
+        user = f"File: {filename}\n\nImplement detailed refactoring plan:\n\n```text\n{content}\n```"
         return self.chat(
             [
                 {"role": "system", "content": sys},
