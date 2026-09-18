@@ -36,5 +36,7 @@ ollama = []  # vi anropar Ollama via HTTP
 noor = "noorlytics.cli.run:cli"
 
 [tool.setuptools]
-packages = ["noorlytics"]
 include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["noorlytics*"]

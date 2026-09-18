@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import os, click
+import os
 import json
+import re
+from datetime import datetime, UTC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple, Optional
@@ -102,9 +104,25 @@ def _single_file(path: Path, allowed_ext: set[str], max_bytes: int) -> Iterable[
 
 def _save_and_print(text: str, out_path: Path, header: str | None = None):
     """Write UTF-8 file and render it in the terminal."""
+    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+    stamped_text = f"Generated: {generated_at}\n\n{text.lstrip()}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(text, encoding="utf-8")
-    render_markdown_cli(header or out_path.name, text, out_path)
+    out_path.write_text(stamped_text, encoding="utf-8")
+    render_markdown_cli(header or out_path.name, stamped_text, out_path)
+
+
+def _next_versioned_markdown_path(reports_dir: Path, stem: str) -> Path:
+    """Return the next versioned Markdown report path for a logical report stem."""
+    legacy_path = reports_dir / f"{stem}.md"
+    pattern = re.compile(rf"^{re.escape(stem)}\.v(\d+)\.md$")
+    max_version = 1 if legacy_path.exists() else 0
+
+    for path in reports_dir.glob(f"{stem}.v*.md"):
+        match = pattern.match(path.name)
+        if match:
+            max_version = max(max_version, int(match.group(1)))
+
+    return reports_dir / f"{stem}.v{max_version + 1}.md"
 
 
 # -------------------- CLI Root --------------------
@@ -132,7 +150,7 @@ def cli(ctx: click.Context, mode: Optional[str]):
     if isinstance(resolved_reports, str):
         resolved_reports = Path(resolved_reports)
 
-    settings_ext = getattr(S, "allowed_ext", [".py"])
+    settings_ext = getattr(S, "allowed_ext", (".py",))
     if isinstance(settings_ext, str):
         settings_ext = [settings_ext]
     resolved_ext = set(map(str.lower, settings_ext))
@@ -170,7 +188,7 @@ def analyze_cmd(state: CLIState, path: Path):
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
             report_md = client.analyze_text(fpath.name, content)
-            out = state.reports_dir / f"{fpath.name}.analyze.md"
+            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
             _save_and_print(report_md, out, header=fpath.name)
             prog.advance(t)
 
@@ -196,7 +214,7 @@ def suggest_cmd(state: CLIState, path: Path):
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
             md = client.suggest_refactors(fpath.name, content)
-            out = state.reports_dir / f"{fpath.name}.suggest.md"
+            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.suggest")
             _save_and_print(md, out, header=fpath.name)
             prog.advance(t)
 
@@ -269,7 +287,7 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
     # 4) (Valfritt men nice) – spara en Markdown-rapport också
     notes_md = result.get("notes_md")
     if notes_md:
-        out_md = state.reports_dir / f"{manifest.name}.deps.md"
+        out_md = _next_versioned_markdown_path(state.reports_dir, f"{manifest.name}.deps")
         _save_and_print(notes_md, out_md, header=f"{manifest.name} – dependencies")
 
 
@@ -295,7 +313,7 @@ def refactor_cmd(state: CLIState, path: Path):
         t = prog.add_task("run", total=len(files))
         for fpath, content in files:
             md = client.suggest_refactors(fpath.name, content)
-            out = state.reports_dir / f"{fpath.name}.refactor.md"
+            out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.refactor")
             _save_and_print(md, out, header=fpath.name)
             prog.advance(t)
 

@@ -14,8 +14,8 @@ requirements.txt
 ## Snabbstart med din wrapper
 ```bash
 cd noor_demo_repo
-noor analyze examples/legacy_project --mode=ollama --out reports/
-noor suggest examples/legacy_project/core/utils.py --mode=ollama
-noor add-tests examples/legacy_project/core/utils.py --mode=ollama
-noor analyze-deps requirements.txt --mode=ollama
+noor --mode=ollama analyze examples/legacy_project
+noor --mode=ollama suggest examples/legacy_project/core/utils.py
+noor --mode=ollama add-tests examples/legacy_project/core/utils.py
+noor --mode=ollama analyze-deps requirements.txt
 ```

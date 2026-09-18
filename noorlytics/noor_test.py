@@ -1,27 +1,12 @@
-import requests
-import json
+"""Manual smoke test for the configured Noorlytics LLM backend."""
 
-OLLAMA_API_URL = "http://localhost:11434/api/generate"
-MODEL = "codellama:7b-instruct"
+from .llm_interface import LLMClient
 
-code = """
-def add(a, b): return a + b
-"""
 
-prompt = f"""You are a senior Python developer.
-Suggest improvements to the following code.
-Return 3 bullet points. Do not rewrite the code.
+def main() -> None:
+    client = LLMClient()
+    print(client.suggest_refactors("example.py", "def add(a, b): return a + b"))
 
-Code:
-{code}
-"""
 
-response = requests.post(OLLAMA_API_URL, json={
-    "model": MODEL,
-    "prompt": prompt,
-    "stream": False,
-    "options": {"temperature": 0.3, "num_predict": 300}
-}, timeout=60)
-
-print("✅ Response:")
-print(response.json()["response"])
+if __name__ == "__main__":
+    main()

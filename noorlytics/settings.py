@@ -40,7 +40,7 @@ class Settings:
     reports_dir: Path = Path(os.getenv("NOOR_REPORTS_DIR", "reports")).resolve()
 
     # CLI collection
-    max_file_bytes: int = int(os.getenv("NOOR_MAX_FILE_BYTES", "100000"))
+    max_file_bytes: int = int(os.getenv("NOOR_MAX_FILE_BYTES", "400000"))
     # Default allowed extensions for CLI collection. Include C# (.cs) by default.
     allowed_ext: tuple[str, ...] = tuple(os.getenv("NOOR_ALLOWED_EXT", ".py,.cs").split(","))
 

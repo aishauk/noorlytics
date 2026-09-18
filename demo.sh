@@ -16,8 +16,8 @@ bind 'set completion-prefix-display-length 2'
 alias noor='NO_COLOR=1 command noor | sed "s/^/\x1b[37m/; s/$/\x1b[0m/"'
 export VIRTUAL_ENV_DISABLE_PROMPT=1
 
-# 4. Aktivera venv (ändra sökväg om din venv heter något annat)
-source venv/bin/activate
+# 4. Activate the virtual environment created by setup_noorlytics.sh.
+source .venv/bin/activate
 
 # 5. Rensa terminalen
 clear

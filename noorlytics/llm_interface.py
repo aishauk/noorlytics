@@ -10,11 +10,52 @@ import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-import openai
+try:
+    import openai
+except ImportError:
+    openai = None
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .settings import get_settings
 from . import net
+
+
+def _summarize_ollama_http_error(error: requests.exceptions.HTTPError) -> str:
+    """Build a user-facing Ollama HTTP error message with response details."""
+    response = error.response
+    body_text = ""
+
+    if response is not None:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        if isinstance(payload, dict):
+            body_text = str(payload.get("error") or payload.get("message") or "").strip()
+
+        if not body_text:
+            try:
+                body_text = response.text.strip()
+            except Exception:
+                body_text = ""
+
+    if len(body_text) > 400:
+        body_text = body_text[:397] + "..."
+
+    details = [
+        "Ollama returned an HTTP error.",
+        "",
+        f"URL: {response.url if response is not None else 'unknown'}",
+        f"Error: {error}",
+    ]
+
+    if response is not None:
+        details.append(f"Status: {response.status_code}")
+    if body_text:
+        details.append(f"Response body: {body_text}")
+
+    return "\n".join(details)
 
 
 def check_ollama_available(timeout: float = 2.0) -> bool:
@@ -39,7 +80,14 @@ class LLMClient:
         self.model = model or S.model
 
         # OpenAI setup
-        openai.api_key = S.openai_api_key
+        if self.mode == "openai":
+            if openai is None:
+                raise RuntimeError(
+                    "OpenAI support is not installed. Install it with: python -m pip install 'noorlytics[openai]'"
+                )
+            if not S.openai_api_key:
+                raise RuntimeError("OPENAI_API_KEY is missing but mode=openai was chosen.")
+            openai.api_key = S.openai_api_key
 
         # Shared defaults
         self.http_timeout = S.http_timeout
@@ -70,8 +118,7 @@ class LLMClient:
             except Exception:
                 pass
         else:
-            if not openai.api_key:
-                raise RuntimeError("OPENAI_API_KEY is missing but mode=openai was chosen.")
+            return
 
     def chat(
         self,
@@ -117,17 +164,17 @@ class LLMClient:
                     "  export NOOR_ANALYZE_NUM_PREDICT=160"
                 )
             except requests.exceptions.HTTPError as e:
-                raise RuntimeError(
-                    "Ollama returned an HTTP error.\n\n"
-                    f"URL: {self.ollama_api_url}\n"
-                    f"Error: {e}"
-                )
+                raise RuntimeError(_summarize_ollama_http_error(e))
 
             data = r.json()
             if "message" in data and isinstance(data["message"], dict):
                 return data["message"].get("content", "")
             return data.get("response", "")
 
+        if openai is None:
+            raise RuntimeError(
+                "OpenAI support is not installed. Install it with: python -m pip install 'noorlytics[openai]'"
+            )
         completion = openai.chat.completions.create(
             model=self.model,
             messages=messages,

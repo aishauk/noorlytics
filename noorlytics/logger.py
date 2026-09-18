@@ -3,8 +3,7 @@ from pathlib import Path
 from .settings import get_settings
 
 def log_to_console(message: str):
-    if not get_settings().compliance_mode:
-        print(message)
+    print(message)
 
 def write_to_file(filepath: str | Path, content: str):
     if not get_settings().compliance_mode:
