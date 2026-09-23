@@ -22,6 +22,7 @@ from noorlytics.analyze_dependencies import (
 from noorlytics.add_tests import generate_unit_tests, render_tests_cli, _detect_language_from_extension
 from noorlytics.refactor_executor import RefactorPlanParser, DependencyGraph
 from noorlytics.file_rewriter import FileRewriter, BackupManager
+from noorlytics.git_integration import GitIntegration
 
 # -------------------- Constants --------------------
 
@@ -472,11 +473,12 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
 @click.option("--dry-run", "-dr", is_flag=True, help="Show diffs without modifying files. Short form: -dr.")
 @click.option("--interactive", "-i", is_flag=True, help="Prompt for confirmation on each change. Short form: -i.")
 @click.option("--undo", "-u", is_flag=True, help="Restore last refactoring changes from backup. Short form: -u.")
+@click.option("--git-commit", "-gc", is_flag=True, help="Stage and commit changes to git after applying. Short form: -gc.")
 @click.pass_obj
-def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, interactive: bool, undo: bool):
+def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, interactive: bool, undo: bool, git_commit: bool):
     """Create AI-assisted refactor plans for file or package.
 
-        Short flags: `-a`, `-dr`, `-i`, `-u`.
+        Short flags: `-a`, `-dr`, `-i`, `-u`, `-gc`.
 
         \b
         Examples:
@@ -485,6 +487,7 @@ def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, intera
             noor refactor file.py -i
             noor refactor file.py -a
             noor refactor file.py -u
+            noor refactor file.py -i -gc
     """
     
     # Handle --undo flag
@@ -543,10 +546,10 @@ def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, intera
                     _show_dry_run(fpath, changes)
                     applied_count += 1
                 elif interactive:
-                    if _interactive_apply(fpath, changes, state.reports_dir):
+                    if _interactive_apply(fpath, changes, state.reports_dir, git_commit):
                         applied_count += 1
                 elif apply:
-                    if _auto_apply(fpath, changes, state.reports_dir):
+                    if _auto_apply(fpath, changes, state.reports_dir, git_commit):
                         applied_count += 1
                 else:
                     # Default: just show plan
@@ -590,11 +593,17 @@ def _show_dry_run(fpath: Path, changes: List) -> None:
     click.echo()
 
 
-def _interactive_apply(fpath: Path, changes: List, reports_dir: Path) -> bool:
+def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool = False) -> bool:
     """Prompt user for each change before applying with smart dependency handling.
     
     Groups changes by dependency chains. When a user approves a change,
     all dependent changes are automatically included and applied together.
+    
+    Args:
+        fpath: Path to file to refactor
+        changes: List of refactoring changes to apply
+        reports_dir: Directory to save diff reports
+        git_commit: If True, stage and commit changes to git after applying
     
     Returns:
         True if changes were applied, False otherwise
@@ -719,6 +728,19 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path) -> bool:
                     _save_diff_report(fpath, applicator, reports_dir)
                     click.echo(click.style(f"✨ Applied {successful}/{len(approved_changes)} changes to {fpath.name}", fg="green"))
                     
+                    # Handle git integration if requested
+                    if git_commit and GitIntegration.is_git_repo(fpath):
+                        if GitIntegration.stage_file(fpath):
+                            commit_msg = f"refactor: {fpath.name} - {successful} change(s) applied via noorlytics"
+                            if GitIntegration.commit(commit_msg, fpath.parent):
+                                click.echo(click.style(f"✅ Committed changes to git", fg="green"))
+                            else:
+                                click.echo(click.style(f"⚠️  Staged file but commit failed", fg="yellow"))
+                        else:
+                            click.echo(click.style(f"⚠️  Failed to stage file in git", fg="yellow"))
+                    elif git_commit:
+                        click.echo(click.style(f"⚠️  Not in a git repository - skipping commit", fg="yellow"))
+                    
                     if failed > 0:
                         click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied:", fg="yellow"))
                         for idx, change in enumerate(approved_changes[successful:]):
@@ -741,11 +763,17 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path) -> bool:
     return False
 
 
-def _auto_apply(fpath: Path, changes: List, reports_dir: Path) -> bool:
+def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool = False) -> bool:
     """Automatically apply safe (LOW priority) changes with smart dependency grouping.
     
     Groups safe changes by dependency chains and applies them together.
     When a safe change is applied, all its dependents are automatically applied too.
+    
+    Args:
+        fpath: Path to file to refactor
+        changes: List of refactoring changes
+        reports_dir: Directory to save diff reports
+        git_commit: If True, stage and commit changes to git after applying
     
     Returns:
         True if changes were applied, False otherwise
@@ -861,6 +889,19 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path) -> bool:
                         click.echo(f"         {click.style(note, fg='blue')}")
                     _render_change_code_block(change)
                     click.echo(f"         Reason: {reason}")
+            
+            # Handle git integration if requested
+            if git_commit and GitIntegration.is_git_repo(fpath):
+                if GitIntegration.stage_file(fpath):
+                    commit_msg = f"refactor: {fpath.name} - {successful} change(s) applied via noorlytics"
+                    if GitIntegration.commit(commit_msg, fpath.parent):
+                        click.echo(click.style(f"✅ Committed changes to git", fg="green"))
+                    else:
+                        click.echo(click.style(f"⚠️  Staged file but commit failed", fg="yellow"))
+                else:
+                    click.echo(click.style(f"⚠️  Failed to stage file in git", fg="yellow"))
+            elif git_commit:
+                click.echo(click.style(f"⚠️  Not in a git repository - skipping commit", fg="yellow"))
             
             click.echo()
             return True
