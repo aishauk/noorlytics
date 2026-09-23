@@ -19,3 +19,4 @@ build/
 # Generated
 reports/
 tests/
+.noor_backups/
