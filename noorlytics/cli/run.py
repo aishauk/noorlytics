@@ -960,6 +960,65 @@ def _save_diff_report(fpath: Path, rewriter: FileRewriter, reports_dir: Path) ->
     diff_path.parent.mkdir(parents=True, exist_ok=True)
     diff_path.write_text(diff, encoding="utf-8")
 
+
+# -------------------- Git Command (Standalone) --------------------
+
+@cli.command("git")
+@click.argument("file", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--commit", "-c", type=str, default=None, 
+              help="Commit message. If provided, stages and commits the file.")
+@click.option("--status", "-s", is_flag=True, help="Show git status for the repository.")
+@click.option("--branch", "-b", is_flag=True, help="Show current branch name.")
+def git_cmd(file: Path, commit: Optional[str], status: bool, branch: bool):
+    """Manage git operations independently (no refactor needed).
+    
+    \b
+    Examples:
+        noor git myfile.py --status
+        noor git myfile.py -s
+        noor git myfile.py --branch
+        noor git myfile.py -b
+        noor git myfile.py --commit "my changes"
+        noor git myfile.py -c "my changes"
+    """
+    
+    # Check if in a git repo
+    if not GitIntegration.is_git_repo(file):
+        click.echo(click.style(f"❌ Not in a git repository: {file}", fg="red"))
+        return
+    
+    work_dir = file.parent if file.is_file() else file
+    
+    # Show branch
+    if branch:
+        current_branch = GitIntegration.get_current_branch(work_dir)
+        click.echo(click.style(f"📌 Current branch: {current_branch or 'unknown'}", fg="cyan"))
+    
+    # Show status
+    if status:
+        git_status = GitIntegration.get_status(work_dir)
+        if git_status:
+            click.echo(click.style("📊 Git status:", fg="cyan"))
+            click.echo(git_status)
+        else:
+            click.echo(click.style("✅ Working directory is clean", fg="green"))
+    
+    # Stage and commit
+    if commit:
+        if file.is_file():
+            if GitIntegration.stage_file(file, work_dir):
+                click.echo(click.style(f"✅ Staged: {file.name}", fg="green"))
+                
+                if GitIntegration.commit(commit, work_dir):
+                    click.echo(click.style(f"✅ Committed: {commit}", fg="green"))
+                else:
+                    click.echo(click.style(f"⚠️  Staged but commit failed", fg="yellow"))
+            else:
+                click.echo(click.style(f"❌ Failed to stage: {file.name}", fg="red"))
+        else:
+            click.echo(click.style(f"❌ File not found: {file}", fg="red"))
+
+
 # -------------------- Entrypoint --------------------
 
 if __name__ == "__main__":

@@ -158,7 +158,7 @@ noor --mode=ollama refactor examples/legacyfile.py -a
 noor --mode=ollama refactor examples/legacyfile.py --undo
 noor --mode=ollama refactor examples/legacyfile.py -u
 
-# Apply changes and commit to git (integrated with refactor)
+# Apply changes and commit to git
 noor --mode=ollama refactor examples/legacyfile.py --interactive --git-commit
 noor --mode=ollama refactor examples/legacyfile.py -i -gc
 
@@ -230,47 +230,59 @@ The `refactor` command now supports automatic application of refactoring suggest
 ### Workflow
 
 1. **Generate refactor plan** (default):
+
    ```bash
    noor refactor myfile.py
    ```
+
    Creates a markdown plan with structured, prioritized changes in `reports/myfile.py.refactor.v1.md`
 
 2. **Preview changes without modifying** (dry-run):
+
    ```bash
    noor refactor myfile.py --dry-run
    noor refactor myfile.py -dr
    ```
+
    Shows a summary of proposed changes in the terminal (no file modifications).
 
 3. **Interactive: Approve changes one-by-one**:
+
    ```bash
    noor refactor myfile.py --interactive
    noor refactor myfile.py -i
    ```
+
    Prompts you before each change. Atomic: all-or-nothing application.
 
 4. **Auto-apply safe changes**:
+
    ```bash
    noor refactor myfile.py --apply
    noor refactor myfile.py -a
    ```
+
    Automatically applies only LOW-priority, low-risk changes. MEDIUM and HIGH priority changes require `--interactive`.
 
 5. **Undo last refactoring**:
+
    ```bash
    noor refactor myfile.py --undo
    noor refactor myfile.py -u
    ```
+
    Restores from the most recent backup in `.noor_backups/`.
 
 6. **Auto-commit to git** (optional):
+
    ```bash
    noor refactor myfile.py --interactive --git-commit
    noor refactor myfile.py -i -gc
-   
+
    noor refactor myfile.py --apply --git-commit
    noor refactor myfile.py -a -gc
    ```
+
    Automatically stages and commits refactored files to git after changes are applied (only if in a git repository).
    Can be combined with `--interactive` or `--apply`. Does nothing on `--dry-run` or `--undo`.
    Commit message: `refactor: myfile.py - N change(s) applied via noorlytics`
