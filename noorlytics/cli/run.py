@@ -111,6 +111,54 @@ def _has_real_dependency(depends_on: Optional[str]) -> bool:
     return bool(depends_on and not depends_on.lower().startswith("none"))
 
 
+def _extract_defined_symbol_name(code: str) -> Optional[str]:
+    """Return the primary function/class name defined by a code snippet, if any."""
+    match = re.search(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", code, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _find_conflicting_symbol_changes(changes: List) -> List[Tuple[int, int, str]]:
+    """Return pairs of changes that rewrite the same original symbol incompatibly.
+
+    Auto-apply should stop when two independent refactor blocks both target the
+    same function/class in different directions (for example, main -> main(args)
+    and main -> run) without a declared dependency between them.
+    """
+    conflicts: List[Tuple[int, int, str]] = []
+
+    for i in range(len(changes)):
+        left = changes[i]
+        left_before = _extract_defined_symbol_name(left.before_code)
+        left_after = _extract_defined_symbol_name(left.after_code)
+
+        if not left_before:
+            continue
+
+        for j in range(i + 1, len(changes)):
+            right = changes[j]
+            right_before = _extract_defined_symbol_name(right.before_code)
+            right_after = _extract_defined_symbol_name(right.after_code)
+
+            if not right_before:
+                continue
+
+            if left_before != right_before:
+                continue
+
+            if _has_real_dependency(getattr(left, 'depends_on', None)) or _has_real_dependency(getattr(right, 'depends_on', None)):
+                continue
+
+            if left_after and right_after and left_after != right_after:
+                conflicts.append((i, j, left_before))
+                continue
+
+            if left_after and left_after != left_before and right_after and right_after != right_before:
+                if left_after != right_after:
+                    conflicts.append((i, j, left_before))
+
+    return conflicts
+
+
 def _save_and_print(text: str, out_path: Path, header: str | None = None):
     """Write UTF-8 file and render it in the terminal."""
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
@@ -469,7 +517,7 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
 
 @cli.command("refactor")
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
-@click.option("--apply", "-a", is_flag=True, help="Apply safe (LOW-priority) refactoring changes automatically. Short form: -a.")
+@click.option("--apply", "-a", is_flag=True, help="Apply all complete refactoring changes automatically. Short form: -a.")
 @click.option("--dry-run", "-dr", is_flag=True, help="Show diffs without modifying files. Short form: -dr.")
 @click.option("--interactive", "-i", is_flag=True, help="Prompt for confirmation on each change. Short form: -i.")
 @click.option("--undo", "-u", is_flag=True, help="Restore last refactoring changes from backup. Short form: -u.")
@@ -640,17 +688,14 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
             position = f"[{idx+1}/{len(changes)}]"
             
             click.echo(f"\n{position} [{change.priority.value}] {change.display_title()}")
+            _render_change_code_block(change, indent="   ")
+            click.echo()
             note = change.display_note()
             if note:
                 click.echo(f"   {click.style(note, fg='blue')}")
             click.echo(f"   Problem: {change.problem_statement}")
             if _has_real_dependency(change.depends_on):
                 click.echo(f"   📌 Depends on: {change.depends_on}")
-            
-            # Show a unified diff preview matching the final apply rendering.
-            click.echo()
-            _render_change_code_block(change, indent="   ")
-            click.echo()
             
             # Check if code blocks are complete
             if not change.is_complete():
@@ -720,14 +765,26 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
         click.echo()
         if click.confirm(f"Write {len(approved_changes)} changes to {fpath.name}?", default=True):
             try:
-                # Apply all approved changes atomically
+                # Apply all approved changes atomically for the chosen set.
                 successful, failed, failure_details = applicator.apply_all_changes(approved_changes)
-                
+
+                if failed > 0:
+                    applicator.rollback()
+                    click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied; rolling back the entire selection.", fg="yellow"))
+                    for idx, change in enumerate(approved_changes):
+                        if idx in failure_details:
+                            reason = failure_details.get(idx, "Code not found in file")
+                            click.echo(f"      ❌ {change.display_title()}")
+                            _render_change_code_block(change)
+                            click.echo(f"         Reason: {reason}")
+                    click.echo(click.style("   No file changes were written because the refactor set was not fully successful.", fg="yellow"))
+                    return False
+
                 if successful > 0:
                     applicator.write()
                     _save_diff_report(fpath, applicator, reports_dir)
                     click.echo(click.style(f"✨ Applied {successful}/{len(approved_changes)} changes to {fpath.name}", fg="green"))
-                    
+
                     # Handle git integration if requested
                     if git_commit and GitIntegration.is_git_repo(fpath):
                         if GitIntegration.stage_file(fpath):
@@ -740,15 +797,7 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
                             click.echo(click.style(f"⚠️  Failed to stage file in git", fg="yellow"))
                     elif git_commit:
                         click.echo(click.style(f"⚠️  Not in a git repository - skipping commit", fg="yellow"))
-                    
-                    if failed > 0:
-                        click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied:", fg="yellow"))
-                        for idx, change in enumerate(approved_changes[successful:]):
-                            reason = failure_details.get(successful + idx, "Code not found in file")
-                            click.echo(f"      ❌ {change.display_title()}")
-                            _render_change_code_block(change)
-                            click.echo(f"         Reason: {reason}")
-                    
+
                     return True
                 else:
                     click.echo(click.style(f"❌ No changes could be applied", fg="red"))
@@ -764,107 +813,130 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
 
 
 def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool = False) -> bool:
-    """Automatically apply safe (LOW priority) changes with smart dependency grouping.
-    
-    Groups safe changes by dependency chains and applies them together.
-    When a safe change is applied, all its dependents are automatically applied too.
-    
+    """Automatically apply all complete refactoring changes with dependency grouping.
+
+    The apply-all path intentionally applies every complete refactor block in the
+    plan, regardless of priority, while still skipping incomplete/truncated code
+    snippets that are not safe to patch automatically.
+
     Args:
         fpath: Path to file to refactor
         changes: List of refactoring changes
         reports_dir: Directory to save diff reports
         git_commit: If True, stage and commit changes to git after applying
-    
+
     Returns:
         True if changes were applied, False otherwise
     """
     # Build dependency graph
     graph = DependencyGraph(changes)
-    
+
     rewriter = FileRewriter(fpath)
-    
-    # Separate changes by priority
-    safe_changes = [c for c in changes if c.is_safe()]
-    unsafe_changes = [c for c in changes if not c.is_safe()]
-    
+
     if not changes:
         click.echo(click.style(f"   ℹ️  No refactors found for {fpath.name}", fg="blue"))
         return False
-    
+
+    complete_changes = [c for c in changes if c.is_complete()]
+    incomplete_changes = [c for c in changes if not c.is_complete()]
+
     # Print header with change summary
     click.echo(click.style(f"\n   📋 Refactoring Plan for {fpath.name}:", fg="cyan"))
-    click.echo(click.style(f"      Total suggestions: {len(changes)} | Safe (LOW): {len(safe_changes)} | Review needed: {len(unsafe_changes)}", fg="blue"))
+    click.echo(click.style(f"      Total suggestions: {len(changes)} | Complete: {len(complete_changes)} | Incomplete: {len(incomplete_changes)}", fg="blue"))
     click.echo()
-    
-    if not safe_changes:
-        click.echo(click.style(f"   ℹ️  No LOW-priority (safe) changes to auto-apply", fg="blue"))
-        if unsafe_changes:
-            click.echo(click.style(f"      {len(unsafe_changes)} change(s) require review (use --interactive)", fg="yellow"))
+
+    if not complete_changes:
+        click.echo(click.style(f"   ℹ️  No complete refactor blocks to auto-apply", fg="blue"))
+        if incomplete_changes:
+            click.echo(click.style(f"      {len(incomplete_changes)} change(s) are truncated or incomplete and were skipped", fg="yellow"))
         return False
-    
-    # Check for incomplete code blocks before applying
-    incomplete_changes = [c for c in safe_changes if not c.is_complete()]
-    complete_safe_changes = [c for c in safe_changes if c.is_complete()]
-    
-    # Group complete safe changes by dependency chains for display only.
-    safe_chains = []
+
+    # Group complete changes by dependency chains for display only.
+    complete_chains = []
     for chain in graph.group_by_chains():
-        safe_chain = [idx for idx in chain if changes[idx].is_safe() and changes[idx].is_complete()]
-        if safe_chain:
-            safe_chains.append(safe_chain)
+        complete_chain = [idx for idx in chain if changes[idx].is_complete()]
+        if complete_chain:
+            complete_chains.append(complete_chain)
+
+    # Reject incompatible refactors that edit the same original symbol without an
+    # explicit dependency chain. This is the root cause behind corrupted output
+    # like main -> main(args) and main -> run being auto-applied together.
+    conflict_pairs = _find_conflicting_symbol_changes(complete_changes)
+    if conflict_pairs:
+        click.echo(click.style("\n   ⚠️  Incompatible auto-apply detected:", fg="yellow"))
+        for i, j, symbol in conflict_pairs:
+            left = complete_changes[i]
+            right = complete_changes[j]
+            click.echo(
+                f"      {left.display_title()} and {right.display_title()} both modify `{symbol}` "
+                "without a valid dependency chain"
+            )
+            _render_change_code_block(left, indent="      ")
+            _render_change_code_block(right, indent="      ")
+        click.echo(click.style("   Skipping auto-apply for this refactor set to avoid corrupting the file.", fg="yellow"))
+        return False
 
     # Apply changes in their original plan order. Group-flattening can reorder
     # independent steps after later dependency chains, which breaks stale-snippet
     # rebasing when a later change expects an earlier rename from the same block.
-    ordered_complete_safe_changes = complete_safe_changes
+    ordered_complete_changes = complete_changes
 
-    # Try to apply only complete safe changes in chain order.
-    successful, failed, failure_details = rewriter.apply_all_changes(ordered_complete_safe_changes)
-    
+    # Try to apply all complete changes in chain order.
+    successful, failed, failure_details = rewriter.apply_all_changes(ordered_complete_changes)
+
     # Display changes with dependency grouping
     displayed = set()
-    
-    for chain_indices in safe_chains:
-        # Show chain header for multi-change chains
+
+    for chain_indices in complete_chains:
         if len(chain_indices) > 1:
             click.echo(click.style(f"   📦 Dependency Chain:", fg="magenta"))
             click.echo(f"      {graph.get_chain_summary(chain_indices)}")
             click.echo()
-    
-    # Display all changes in organized manner
+
     for i, change in enumerate(changes, 1):
-        if i-1 in displayed:
+        if i - 1 in displayed:
             continue
-        
-        is_safe = change.is_safe()
-        status_icon = "✅" if is_safe else "⏭️"
+
         priority = change.priority.value if hasattr(change, 'priority') else "UNKNOWN"
-        
-        # Check if incomplete
+
         if change in incomplete_changes:
             click.echo(f"   ⏭️  [{i}] {change.display_title()} ({priority})")
             click.echo(f"      ⏭️  SKIPPED: Code snippet is truncated/incomplete")
             if _has_real_dependency(getattr(change, 'depends_on', None)):
                 click.echo(f"      📌 Depends on: {change.depends_on}")
             click.echo()
-        elif not is_safe:
-            click.echo(f"   {status_icon} [{i}] {change.display_title()} ({priority})")
-            click.echo(f"      ⏸️  SKIPPED: Not a safe change (use --interactive to review)")
+        else:
+            click.echo(f"   ✅ [{i}] {change.display_title()} ({priority})")
+            click.echo(f"      ✅ AUTO-APPLYING: complete refactor block")
             if _has_real_dependency(getattr(change, 'depends_on', None)):
                 click.echo(f"      📌 Depends on: {change.depends_on}")
+            _render_change_code_block(change)
             click.echo()
-        
-        displayed.add(i-1)
-    
-    # Now report on applied vs failed
+
+        displayed.add(i - 1)
+
+    if failed > 0:
+        rewriter.rollback()
+        click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied; rolling back the entire selection.", fg="yellow"))
+        for idx, change in enumerate(complete_changes):
+            if idx in failure_details:
+                reason = failure_details.get(idx, "Code not found in file")
+                click.echo(f"      ❌ {change.display_title()}")
+                note = change.display_note()
+                if note:
+                    click.echo(f"         {click.style(note, fg='blue')}")
+                _render_change_code_block(change)
+                click.echo(f"         Reason: {reason}")
+        click.echo(click.style("   No file changes were written because the refactor set was not fully successful.", fg="yellow"))
+        return False
+
     if successful > 0:
         try:
             rewriter.write()
             _save_diff_report(fpath, rewriter, reports_dir)
-            
-            # Show applied changes
+
             click.echo(click.style(f"   ✨ Successfully applied {successful} change(s):", fg="green"))
-            for change in complete_safe_changes[:successful]:
+            for change in complete_changes[:successful]:
                 click.echo(f"      ✅ {change.display_title()}")
                 note = change.display_note()
                 if note:
@@ -872,25 +944,13 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
                 _render_change_code_block(change)
                 if _has_real_dependency(getattr(change, 'depends_on', None)):
                     click.echo(f"         📌 Depends on: {change.depends_on}")
-            
+
             if incomplete_changes:
                 click.echo(click.style(f"\n   ⚠️  {len(incomplete_changes)} change(s) skipped (incomplete/truncated):", fg="yellow"))
                 for change in incomplete_changes:
                     click.echo(f"      ⏭️ {change.display_title()}")
                     click.echo(f"         Code snippet contains truncation markers ('...')")
-            
-            if failed > 0:
-                click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied:", fg="yellow"))
-                for idx, change in enumerate(complete_safe_changes[successful:]):
-                    reason = failure_details.get(successful + idx, "Code not found in file")
-                    click.echo(f"      ❌ {change.display_title()}")
-                    note = change.display_note()
-                    if note:
-                        click.echo(f"         {click.style(note, fg='blue')}")
-                    _render_change_code_block(change)
-                    click.echo(f"         Reason: {reason}")
-            
-            # Handle git integration if requested
+
             if git_commit and GitIntegration.is_git_repo(fpath):
                 if GitIntegration.stage_file(fpath):
                     commit_msg = f"refactor: {fpath.name} - {successful} change(s) applied via noorlytics"
@@ -902,22 +962,22 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
                     click.echo(click.style(f"⚠️  Failed to stage file in git", fg="yellow"))
             elif git_commit:
                 click.echo(click.style(f"⚠️  Not in a git repository - skipping commit", fg="yellow"))
-            
+
             click.echo()
             return True
         except Exception as e:
             click.echo(click.style(f"   ❌ Failed to write changes: {e}", fg="red"))
             return False
-    
-    if failed > 0 or incomplete_changes:
+
+    if incomplete_changes:
         if incomplete_changes:
             click.echo(click.style(f"   ⚠️  {len(incomplete_changes)} change(s) skipped (incomplete/truncated)", fg="yellow"))
             for change in incomplete_changes:
                 click.echo(f"      ⏭️ {change.display_title()}")
-        
+
         if failed > 0:
-            click.echo(click.style(f"   ⚠️  All {failed} complete safe change(s) failed to apply", fg="yellow"))
-            for idx, change in enumerate(complete_safe_changes):
+            click.echo(click.style(f"   ⚠️  All {failed} complete change(s) failed to apply", fg="yellow"))
+            for idx, change in enumerate(complete_changes):
                 if idx in failure_details:
                     reason = failure_details[idx]
                     click.echo(f"      ❌ {change.display_title()}")
@@ -926,7 +986,7 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
                         click.echo(f"         {click.style(note, fg='blue')}")
                     _render_change_code_block(change)
                     click.echo(f"         Reason: {reason}")
-    
+
     return False
 
 

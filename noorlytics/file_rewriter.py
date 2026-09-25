@@ -261,6 +261,75 @@ class FileRewriter:
             rebased_code = re.sub(rf'\b{re.escape(old_name)}\b', new_name, rebased_code)
         return rebased_code
 
+    def _extract_defined_symbol_names(self, code: str) -> set[str]:
+        """Extract Python function/class names from a code snippet."""
+        return set(re.findall(r'^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*', code, flags=re.MULTILINE))
+
+    def _is_likely_rename(self, old_name: str, new_name: str) -> bool:
+        """Heuristic for whether two identifiers represent a rename."""
+        if len(old_name) < 2 or len(new_name) < 2:
+            return False
+
+        old_snake = old_name.lower().replace('_', '')
+        new_snake = new_name.lower().replace('_', '')
+        common_chars = len(set(old_snake) & set(new_snake))
+        min_chars = min(len(old_snake), len(new_snake))
+        return common_chars >= min_chars * 0.5
+
+    def _infer_symbol_renames(self, before_code: str, after_code: str) -> list[tuple[str, str]]:
+        """Infer direct symbol renames from a function/class definition pair.
+
+        This lets a rename like process_data -> process_items propagate to
+        call sites and dependent references in the same file, not only to the
+        definition block itself.
+        """
+        before_symbols = self._extract_defined_symbol_names(before_code)
+        after_symbols = self._extract_defined_symbol_names(after_code)
+        if not before_symbols or not after_symbols:
+            return []
+
+        renamed_symbols: list[tuple[str, str]] = []
+        for old_name in sorted(before_symbols):
+            if old_name in after_symbols:
+                continue
+            for new_name in sorted(after_symbols):
+                if new_name in before_symbols:
+                    continue
+                if self._is_likely_rename(old_name, new_name):
+                    renamed_symbols.append((old_name, new_name))
+                    break
+
+        if renamed_symbols:
+            return renamed_symbols
+
+        # Fall back to a direct 1:1 match when the renamed symbol is the only
+        # meaningful definition difference in the snippet.
+        before_list = sorted(before_symbols)
+        after_list = sorted(after_symbols)
+        if len(before_list) == len(after_list):
+            return [(old_name, new_name) for old_name, new_name in zip(before_list, after_list)]
+
+        return []
+
+    def _find_named_python_block(self, symbol_name: str, content: str) -> str | None:
+        """Find the full def/class block for a named symbol in the current content."""
+        lines = content.split('\n')
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(f"def {symbol_name}(") or stripped.startswith(f"class {symbol_name}"):
+                base_indent = len(line) - len(line.lstrip())
+                end_idx = len(lines)
+                for next_idx in range(idx + 1, len(lines)):
+                    next_stripped = lines[next_idx].strip()
+                    if not next_stripped:
+                        continue
+                    next_indent = len(lines[next_idx]) - len(lines[next_idx].lstrip())
+                    if next_indent <= base_indent:
+                        end_idx = next_idx
+                        break
+                return '\n'.join(lines[idx:end_idx])
+        return None
+
     def _find_enclosing_python_block(self, code: str, content: str) -> str | None:
         """Find the full Python def/class block identified by code's anchor line."""
         anchor = self._get_block_anchor(code)
@@ -341,6 +410,14 @@ class FileRewriter:
                 relevant_changes.append((previous_before, previous_after))
                 if self._find_with_flexible_match(previous_after, self.current_content):
                     return previous_after
+
+        # If the same symbol still exists in the current file but the function
+        # signature or surrounding block was already edited by an earlier step,
+        # rebase against the live symbol block instead of the stale pre-edit version.
+        for symbol_name in sorted(self._extract_defined_symbol_names(before_code) | self._extract_defined_symbol_names(after_code)):
+            candidate = self._find_named_python_block(symbol_name, self.current_content)
+            if candidate and self._find_with_flexible_match(candidate, self.current_content):
+                return candidate
 
         rebased_before = before_code
         applied_replacements = False
@@ -494,28 +571,38 @@ class FileRewriter:
         """
         if not before_code:
             return False
-        
-        # Try applying with flexible matching
+
+        applied_before = before_code
         new_content = self._apply_change_with_flexible_match(before_code, after_code, self.current_content)
-        
+
+        if new_content is None or new_content == self.current_content:
+            rebased_before = self._find_rebased_before_code(before_code, after_code)
+            if rebased_before:
+                new_content = self._apply_change_with_flexible_match(rebased_before, after_code, self.current_content)
+                applied_before = rebased_before
+
         if new_content is None or new_content == self.current_content:
             # No actual change made or no match found
             return False
-        
+
+        symbol_renames = self._infer_symbol_renames(before_code, after_code)
+        for old_name, new_name in symbol_renames:
+            new_content = self._apply_identifier_renames(new_content, [(old_name, new_name)])
+
         # Validate by checking that the new content contains at least some key part of after_code
         # Since after_code may be indented when applied, we check for normalized versions
         if validate:
             # Check if the main content is there (check first meaningful line)
             after_lines = [line.strip() for line in after_code.split('\n') if line.strip()]
             content_lines = [line.strip() for line in new_content.split('\n')]
-            
+
             # Check if at least the first non-empty line of after_code is in the result
             if after_lines and after_lines[0] not in content_lines:
                 # Couldn't find even the first line - validation failed
                 return False
-        
+
         self.current_content = new_content
-        self.changes_applied.append((before_code, after_code))
+        self.changes_applied.append((applied_before, after_code))
         return True
     
     def apply_all_changes(self, changes: List) -> Tuple[int, int, dict]:

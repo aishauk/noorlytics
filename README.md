@@ -150,7 +150,7 @@ noor --mode=ollama refactor examples/legacyfile.py -dr
 noor --mode=ollama refactor examples/legacyfile.py --interactive
 noor --mode=ollama refactor examples/legacyfile.py -i
 
-# Automatically apply safe (LOW-priority) changes
+# Automatically apply all complete refactor changes
 noor --mode=ollama refactor examples/legacyfile.py --apply
 noor --mode=ollama refactor examples/legacyfile.py -a
 
@@ -162,7 +162,7 @@ noor --mode=ollama refactor examples/legacyfile.py -u
 noor --mode=ollama refactor examples/legacyfile.py --interactive --git-commit
 noor --mode=ollama refactor examples/legacyfile.py -i -gc
 
-# Auto-apply safe changes and commit to git
+# Auto-apply all complete changes and commit to git
 noor --mode=ollama refactor examples/legacyfile.py --apply --git-commit
 noor --mode=ollama refactor examples/legacyfile.py -a -gc
 
@@ -212,7 +212,7 @@ noor git myfile.py -c "my changes"
 - recursively finds all supported files when given a directory
 - writes versioned Markdown reports to `reports/`
 - for packages, shows progress and summary of generated refactor plans
-- supports automatic file rewriting with `--apply`/`-a`, `--interactive`/`-i`, `--dry-run`/`-dr`, `--undo`/`-u`, `--git-commit`/`-gc`
+- supports automatic file rewriting with `--apply`/`-a` for all complete refactor blocks, `--interactive`/`-i`, `--dry-run`/`-dr`, `--undo`/`-u`, `--git-commit`/`-gc`
 - see File Rewriting section below for details
 
 `git`
