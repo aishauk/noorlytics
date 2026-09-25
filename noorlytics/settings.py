@@ -30,7 +30,7 @@ class Settings:
     temp_analyze: float = float(os.getenv("NOOR_TEMP_ANALYZE", "0.0"))
     temp_refactor: float = float(os.getenv("NOOR_TEMP_REFACTOR", "0.0"))
     analyze_num_predict: int = int(os.getenv("NOOR_ANALYZE_NUM_PREDICT", "512"))
-    refactor_num_predict: int = int(os.getenv("NOOR_REFACTOR_NUM_PREDICT", "1024"))
+    refactor_num_predict: int = int(os.getenv("NOOR_REFACTOR_NUM_PREDICT", "2048"))
 
     # Chunking
     max_chunk_lines: int = int(os.getenv("NOOR_MAX_CHUNK_LINES", "120"))
