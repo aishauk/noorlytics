@@ -43,6 +43,24 @@ def _summarize_ollama_http_error(error: requests.exceptions.HTTPError) -> str:
     if len(body_text) > 400:
         body_text = body_text[:397] + "..."
 
+    lower_body = body_text.lower()
+    if response is not None and response.status_code in {500, 503} and (
+        "loading model" in lower_body or "model is loading" in lower_body
+    ):
+        return "\n".join(
+            [
+                "Ollama is still loading the selected model.",
+                "",
+                f"Model: {get_settings().model}",
+                f"URL: {response.url}",
+                "",
+                "What to do:",
+                "  1. Wait a few seconds and run the command again.",
+                f"  2. Preload the model once: ollama run {get_settings().model} \"hello\"",
+                "  3. If startup is slow, increase the timeout: export NOOR_HTTP_TIMEOUT=300",
+            ]
+        )
+
     details = [
         "Ollama returned an HTTP error.",
         "",
@@ -276,37 +294,152 @@ class LLMClient:
             max_tokens=self.refactor_num_predict,
         )
 
+    @staticmethod
+    def _ensure_refactor_format(text: str) -> str:
+        """
+        Post-process refactor output to ensure it has [PRIORITY] markers.
+        Helps Ollama output conform to expected format even if slightly off.
+        """
+        import re
+        
+        lines = text.split('\n')
+        result = []
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            # Check if line already has a priority marker
+            if re.match(r'^\s*\[(?:LOW|MEDIUM|HIGH)\]', line):
+                result.append(line)
+                i += 1
+            # Check if line looks like a refactoring title (heuristic: ends with verb or description)
+            elif re.match(r'^#{1,3}\s+\[(?:LOW|MEDIUM|HIGH)\]', line):
+                # Already formatted markdown header
+                result.append(line)
+                i += 1
+            # Look for standalone markers that need the title moved to same line
+            elif line.strip() in ['[LOW]', '[MEDIUM]', '[HIGH]']:
+                # Marker without title - try to get title from next line
+                if i + 1 < len(lines) and lines[i + 1].strip():
+                    title = lines[i + 1].strip()
+                    # Remove markdown headers from title if present
+                    title = re.sub(r'^#+\s*', '', title)
+                    result.append(f"{line.strip()} {title}")
+                    i += 2
+                else:
+                    result.append(line)
+                    i += 1
+            else:
+                result.append(line)
+                i += 1
+        
+        return '\n'.join(result)
+
     def refactor(self, filename: str, content: str) -> str:
         """Generate detailed refactoring implementation plan with step-by-step guidance."""
         sys = (
             "You are an expert code refactoring architect. Your goal is to create a detailed, "
             "ACTIONABLE refactoring implementation plan that a developer can execute with confidence.\n\n"
-            "CRITICAL REFACTORING IMPLEMENTATION RULES:\n"
-            "1. START WITH ASSESSMENT: Identify code smells, complexity issues, and design problems\n"
-            "2. PROPOSE INCREMENTAL STEPS: Break large refactorings into small, testable changes\n"
-            "3. PROVIDE COMPLETE CODE: Show full BEFORE and AFTER code blocks for each change\n"
-            "4. EXPLAIN EACH CHANGE: Why this change matters + specific benefits (performance/readability/maintainability)\n"
-            "5. BACKWARDS COMPATIBILITY: Address API compatibility, deprecation paths, and migration needs\n"
-            "6. DETAILED TESTING PLAN: Specify exactly what to test and how to validate each step\n"
-            "7. ROLLBACK STRATEGY: If something breaks, how to safely revert with minimal impact\n\n"
-            "IMPLEMENTATION CHECKLIST FORMAT:\n"
-            "For EACH refactoring, provide:\n"
-            "- [HIGH/MEDIUM/LOW] priority tag\n"
-            "- Problem statement (1-2 sentences of current issue)\n"
-            "- Solution (concrete change with BEFORE/AFTER code blocks)\n"
-            "- Implementation steps as nested checklist (- [ ])\n"
-            "- Validation instructions (how to test this specific change)\n"
-            "- Estimated impact on: readability, performance, maintainability\n"
-            "- Potential breakage points or edge cases\n\n"
-            "QUALITY CRITERIA FOR REFACTORING:\n"
-            "✓ Every suggested change must be implementable by a mid-level developer\n"
+            "🔴 CRITICAL INSTRUCTION:\n"
+            "When you show 'Before:' code, you MUST copy-paste EXACTLY from the input file.\n"
+            "Include ALL docstrings, comments, blank lines, and indentation exactly as they appear.\n"
+            "Do NOT simplify, remove docstrings, or clean up the code in the 'Before' section.\n"
+            "The exact match is needed for code substitution tools to work.\n\n"
+            "⚠️  DEPENDENCY ANALYSIS (CRITICAL FOR SUCCESS!):\n"
+            "BEFORE ordering refactorings, analyze dependencies between ALL proposed changes:\n"
+            "1. Identify which changes AFFECT THE SAME CODE ELEMENTS (variable names, function names, etc.)\n"
+            "2. Identify which changes REQUIRE OTHER CHANGES TO BE APPLIED FIRST\n"
+            "3. For EACH refactoring, determine if it depends on any other refactoring\n"
+            "4. EXPLICITLY STATE dependencies using this format: 'Depends on: Change N (description)'\n"
+            "5. If truly independent, write: 'Depends on: None (independent change)'\n\n"
+            "DEPENDENCY EXAMPLES:\n"
+            "- If Change 1 renames function 'process_data' to 'process_items',\n"
+            "  and Change 2 updates a call site of 'process_data', then Change 2 depends on Change 1\n"
+            "- If Change 1 defines a new variable and Change 2 uses that variable,\n"
+            "  then Change 2 depends on Change 1\n"
+            "- If Change 1 renames a variable and Change 2 uses that variable elsewhere,\n"
+            "  then Change 2 depends on Change 1\n\n"
+            "⚠️  DEPENDENCY ORDERING (IMPORTANT!):\n"
+            "Order refactorings so that changes can be applied sequentially:\n"
+            "1. FIRST: List independent refactorings that don't depend on each other\n"
+            "2. THEN: List dependent refactorings (each depending on earlier ones)\n"
+            "3. Dependent refactorings must reference their dependencies by change number and description\n"
+            "This allows developers to apply independent batches together, then dependent ones.\n\n"
+            "⚠️  MANDATORY OUTPUT FORMAT (MUST FOLLOW EXACTLY):\n"
+            "Start EVERY refactoring suggestion with a priority marker on its own line:\n"
+            "[LOW] or [MEDIUM] or [HIGH]\n"
+            "Then on the next line, put the title/summary of the refactoring.\n"
+            "Follow with Problem: and other sections.\n\n"
+            "EXAMPLE (follow this format EXACTLY):\n"
+            "---\n"
+            "[LOW] Remove Unnecessary Variable Assignment\n"
+            "Problem: The function creates intermediate variables that can be eliminated.\n"
+            "Depends on: None (independent change)\n\n"
+            "**Before:**\n"
+            "```python\n"
+            "def add(x, y):\n"
+            "    result = x + y\n"
+            "    return result\n"
+            "```\n\n"
+            "**After:**\n"
+            "```python\n"
+            "def add(x, y):\n"
+            "    return x + y\n"
+            "```\n\n"
+            "Validation instructions: Test add(2, 3) returns 5.\n"
+            "Potential breakage: None - direct return is equivalent.\n"
+            "Estimated impact: Minimal code simplification.\n"
+            "---\n\n"
+            "CRITICAL RULES:\n"
+            "1. EVERY refactoring MUST start with [LOW], [MEDIUM], or [HIGH]\n"
+            "2. Put priority marker at the BEGINNING of each refactoring (line 1 of new refactoring)\n"
+            "3. Show COMPLETE before/after code blocks (no pseudocode)\n"
+            "4. Explain why the change matters\n"
+            "5. Include validation instructions\n"
+            "6. Note potential breakage points\n"
+            "7. Be specific about impact\n"
+            "8. Separate each refactoring with ---\n"
+            "9. Order changes: independent first, then dependent ones\n"
+            "10. Include 'Depends on:' field for each refactoring (even if 'None')\n\n"
+            "PRIORITY GUIDELINES:\n"
+            "[LOW] = Safe, no dependencies, can auto-apply (e.g., variable naming, string formatting)\n"
+            "[MEDIUM] = Requires testing (e.g., logic simplification, function extraction)\n"
+            "[HIGH] = Major changes (e.g., architecture changes, API modifications)\n\n"
+            "QUALITY CRITERIA:\n"
             "✓ Code examples must be copy-paste ready (no pseudocode)\n"
-            "✓ Testing strategy must be specific to the change (not generic)\n"
+            "✓ Every suggestion must have BEFORE and AFTER code blocks\n"
+            "✓ Each change must be implementable by a mid-level developer\n"
             "✓ Prioritize quick wins (under 1 hour) before major refactors\n"
-            "✓ Never suggest refactoring without showing impact"
+            "✓ Order changes so they can be applied sequentially without conflicts"
         )
-        user = f"File: {filename}\n\nImplement detailed refactoring plan:\n\n```text\n{content}\n```"
-        return self.chat(
+        user = (
+            f"File: {filename}\n\n"
+            "⚠️  CRITICAL: When showing BEFORE code, copy-paste EXACTLY from the file above (including ALL docstrings, comments, and whitespace).\n"
+            "Do NOT simplify, summarize, or remove docstrings. Use the EXACT code as it appears.\n\n"
+            "📌 DEPENDENCY ANALYSIS REQUIRED:\n"
+            "1. Identify which refactorings affect the same code elements (renames, variable updates, etc.)\n"
+            "2. For each refactoring, explicitly state its dependencies on other refactorings\n"
+            "3. Use format: 'Depends on: Change N (description)' OR 'Depends on: None (independent change)'\n"
+            "4. Order refactorings: independent ones first, then dependent ones in order of dependencies\n"
+            "Example: If Change 1 renames a function and Change 2 updates call sites of that function,\n"
+            "then Change 2 should have 'Depends on: Change 1 (rename function)'\n\n"
+            "📌 ORDER REFACTORINGS CAREFULLY:\n"
+            "1. Suggest independent refactorings FIRST (ones that don't affect each other)\n"
+            "2. Then suggest dependent refactorings in the correct sequence\n"
+            "3. Mark each with 'Depends on: ...' so developers understand the order\n"
+            "This way, the first batch can all be applied together, then the next batch, etc.\n\n"
+            "Create a detailed refactoring plan using the mandatory format (start each refactoring with [LOW], [MEDIUM], or [HIGH]):\n\n"
+            f"```python\n{content}\n```\n\n"
+            "Remember:\n"
+            "  ✓ EVERY refactoring MUST start with [PRIORITY] tag\n"
+            "  ✓ BEFORE code must be EXACTLY what's in the file (docstrings + comments included)\n"
+            "  ✓ Analyze dependencies between ALL proposed changes\n"
+            "  ✓ Order changes: independent first, then dependent\n"
+            "  ✓ ALWAYS include 'Depends on:' field for EVERY refactoring (even if 'None')\n"
+            "  ✓ Explicitly reference other changes: 'Depends on: Change N (what that change does)'"
+        )
+        result = self.chat(
             [
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user},
@@ -314,6 +447,8 @@ class LLMClient:
             temperature=self.temp_refactor,
             max_tokens=self.refactor_num_predict,
         )
+        # Post-process to ensure proper format for parser
+        return self._ensure_refactor_format(result)
 
     def generate_tests(self, filename: str, content: str, language_hint: str = "python") -> str:
         sys = (

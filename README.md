@@ -21,16 +21,13 @@ Stable:
 - `analyze` for supported source files
 - `suggest` for refactoring guidance
 - `analyze-deps` for dependency, license, and vulnerability checks
+- `refactor` with automatic file rewriting (see File Rewriting section below)
 - Versioned Markdown reports with `Generated:` timestamps
 
 Partial:
 
 - `add-tests` is strongest for Python and less predictable for other languages
 - Dependency analysis works across multiple ecosystems, but unusual manifests may need manual review
-
-Experimental:
-
-- `refactor` currently generates a refactor plan in Markdown; it does not rewrite source files
 
 ## Requirements
 
@@ -144,6 +141,38 @@ noor --mode=ollama refactor examples/legacyfile.py
 
 # Create refactor plans for entire package
 noor --mode=ollama refactor examples/
+
+# Preview changes without modifying files
+noor --mode=ollama refactor examples/legacyfile.py --dry-run
+noor --mode=ollama refactor examples/legacyfile.py -dr
+
+# Interactively apply changes (approve each one)
+noor --mode=ollama refactor examples/legacyfile.py --interactive
+noor --mode=ollama refactor examples/legacyfile.py -i
+
+# Automatically apply all complete refactor changes
+noor --mode=ollama refactor examples/legacyfile.py --apply
+noor --mode=ollama refactor examples/legacyfile.py -a
+
+# Restore from backup
+noor --mode=ollama refactor examples/legacyfile.py --undo
+noor --mode=ollama refactor examples/legacyfile.py -u
+
+# Apply changes and commit to git
+noor --mode=ollama refactor examples/legacyfile.py --interactive --git-commit
+noor --mode=ollama refactor examples/legacyfile.py -i -gc
+
+# Auto-apply all complete changes and commit to git
+noor --mode=ollama refactor examples/legacyfile.py --apply --git-commit
+noor --mode=ollama refactor examples/legacyfile.py -a -gc
+
+# Standalone git operations (no refactor needed)
+noor git myfile.py --status
+noor git myfile.py -s
+noor git myfile.py --branch
+noor git myfile.py -b
+noor git myfile.py --commit "my changes"
+noor git myfile.py -c "my changes"
 ```
 
 ## Command Reference
@@ -183,7 +212,111 @@ noor --mode=ollama refactor examples/
 - recursively finds all supported files when given a directory
 - writes versioned Markdown reports to `reports/`
 - for packages, shows progress and summary of generated refactor plans
-- note: generates plans only, does not automatically apply code changes
+- supports automatic file rewriting with `--apply`/`-a` for all complete refactor blocks, `--interactive`/`-i`, `--dry-run`/`-dr`, `--undo`/`-u`, `--git-commit`/`-gc`
+- see File Rewriting section below for details
+
+`git`
+
+- standalone git operations (does NOT require refactor)
+- stage files with `--commit` option
+- show git status with `--status`
+- show current branch with `--branch`
+- works independently from any refactoring workflow
+
+## File Rewriting (Stable)
+
+The `refactor` command now supports automatic application of refactoring suggestions:
+
+### Workflow
+
+1. **Generate refactor plan** (default):
+
+   ```bash
+   noor refactor myfile.py
+   ```
+
+   Creates a markdown plan with structured, prioritized changes in `reports/myfile.py.refactor.v1.md`
+
+2. **Preview changes without modifying** (dry-run):
+
+   ```bash
+   noor refactor myfile.py --dry-run
+   noor refactor myfile.py -dr
+   ```
+
+   Shows a summary of proposed changes in the terminal (no file modifications).
+
+3. **Interactive: Approve changes one-by-one**:
+
+   ```bash
+   noor refactor myfile.py --interactive
+   noor refactor myfile.py -i
+   ```
+
+   Prompts you before each change. Atomic: all-or-nothing application.
+
+4. **Auto-apply safe changes**:
+
+   ```bash
+   noor refactor myfile.py --apply
+   noor refactor myfile.py -a
+   ```
+
+   Automatically applies only LOW-priority, low-risk changes. MEDIUM and HIGH priority changes require `--interactive`.
+
+5. **Undo last refactoring**:
+
+   ```bash
+   noor refactor myfile.py --undo
+   noor refactor myfile.py -u
+   ```
+
+   Restores from the most recent backup in `.noor_backups/`.
+
+6. **Auto-commit to git** (optional):
+
+   ```bash
+   noor refactor myfile.py --interactive --git-commit
+   noor refactor myfile.py -i -gc
+
+   noor refactor myfile.py --apply --git-commit
+   noor refactor myfile.py -a -gc
+   ```
+
+   Automatically stages and commits refactored files to git after changes are applied (only if in a git repository).
+   Can be combined with `--interactive` or `--apply`. Does nothing on `--dry-run` or `--undo`.
+   Commit message: `refactor: myfile.py - N change(s) applied via noorlytics`
+
+### Safety Features
+
+- **Atomic changes**: All changes apply or none do. Partial refactoring is not allowed.
+- **Automatic backups**: Original file is backed up to `.noor_backups/` before modification.
+- **Git-compatible diffs**: Changes are saved to `reports/{file}.refactor.diff` for integration with git workflows.
+- **Priority-based execution**: HIGH and MEDIUM priority changes require explicit approval; LOW priority are auto-safe.
+- **Full rollback**: `--undo` can restore any previous state.
+
+### Example Workflow
+
+```bash
+# 1. Generate and review plan
+noor refactor legacy_code.py
+
+# 2. See what would change without modifying
+noor refactor legacy_code.py --dry-run
+noor refactor legacy_code.py -dr
+
+# 3. Interactively approve high-impact changes
+noor refactor legacy_code.py --interactive
+noor refactor legacy_code.py -i
+
+# 4. If something breaks, restore:
+noor refactor legacy_code.py --undo
+noor refactor legacy_code.py -u
+
+# 5. (Optionally) auto-apply only low-risk refactors to clean up:
+noor refactor legacy_code.py --apply
+noor refactor legacy_code.py -a
+```
 
 ## Configuration
 
