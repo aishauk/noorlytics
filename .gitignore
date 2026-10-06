@@ -20,3 +20,8 @@ build/
 reports/
 tests/
 .noor_backups/
+.pytest_cache/
+.noorlytics/
+
+# Backend runtime
+backend/
