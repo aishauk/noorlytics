@@ -1,0 +1,17 @@
+{
+  "customer_name": "Large Enterprise",
+  "industry": "enterprise",
+  "deployment": "internal and customer-facing",
+  "risk_preferences": {
+    "security": "high",
+    "business_continuity": "high",
+    "cost_control": "medium",
+    "delivery_speed": "low"
+  },
+  "constraints": {
+    "upgrade_window_days": 60,
+    "requires_oss_license_review": true,
+    "legacy_runtime": "Java 8",
+    "min_security_score": 8
+  }
+}
