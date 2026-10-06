@@ -25,3 +25,4 @@ tests/
 
 # Backend runtime
 backend/
+frontend/
