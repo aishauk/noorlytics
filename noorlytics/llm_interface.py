@@ -175,7 +175,7 @@ class LLMClient:
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_file = self.cache_dir / f"{cache_key}.json"
-            cache_file.write_text(json.dumps({"plan": plan}))
+            cache_file.write_text(json.dumps({"plan": plan}, indent=2, ensure_ascii=False))
         except Exception:
             pass  # Silently fail on cache write errors
 
