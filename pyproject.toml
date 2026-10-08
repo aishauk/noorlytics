@@ -27,6 +27,7 @@ dependencies = [
   "tabulate",
   "typing-extensions",
   "setuptools",
+  "psutil",
 ]
 
 [project.optional-dependencies]

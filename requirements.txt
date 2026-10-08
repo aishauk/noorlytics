@@ -21,3 +21,6 @@ rich
 
 # CLI utilities
 tabulate
+
+# Performance monitoring
+psutil
