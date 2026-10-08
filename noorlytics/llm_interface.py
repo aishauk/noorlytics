@@ -121,7 +121,8 @@ class LLMClient:
         self.keep_alive = S.keep_alive
         
         # Cache directory for refactor plans (Issue 2: Redundant LLM Calls)
-        self.cache_dir = Path(".noorlytics") / "refactor_cache"
+        # Unified with other caches under .noor/cache/
+        self.cache_dir = Path(".noor/cache") / "refactor_cache"
         self._model_warmed = False
 
     def warmup(self) -> bool:

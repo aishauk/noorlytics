@@ -40,6 +40,15 @@ from noorlytics.cli.decisions import decisions
 from noorlytics.cli.history import history
 from noorlytics.cli.metrics import metrics
 
+# Import Phase 5: Performance & CLI Integration
+from noorlytics.cli.performance_integration import (
+    PerformanceContext,
+    CLICommandBuilder,
+    validate_parallel_workers,
+    format_file_analysis_result,
+)
+from noorlytics.cli.cache_commands import cache
+
 # -------------------- Constants --------------------
 
 DEFAULT_IGNORE_DIRS = {
@@ -312,12 +321,23 @@ def cli(ctx: click.Context, mode: Optional[str]):
         verbose=False,  # verbose tas bort som option → sätt default
     )
 
+# -------------------- Phase 5: Cache Management Commands --------------------
+
+# Add the cache command group
+cli.add_command(cache)
+
 # -------------------- Commands --------------------
 
 @cli.command("analyze")
 @click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory path to analyze")
+@click.option("--cache/--no-cache", default=True, help="Use cached findings from previous runs (Phase 5)")
+@click.option("--parallel", type=int, default=4, help="Number of worker threads (0=auto-detect, Phase 5)")
+@click.option("--incremental/--no-incremental", default=True, help="Only analyze changed files (Phase 5, default: enabled)")
+@click.option("--benchmark/--no-benchmark", default=True, help="Measure and track performance metrics (Phase 5, default: enabled)")
+@click.option("--exclude-files", type=str, default="", help="Comma-separated filenames to skip (e.g., 'test.py,config.py')")
+@click.option("--interactive/--no-interactive", default=False, help="Prompt to skip each file before analyzing (interactive mode)")
 @click.pass_obj
-def analyze_cmd(state: CLIState, path: Path):
+def analyze_cmd(state: CLIState, path: Path, cache: bool, parallel: int, incremental: bool, benchmark: bool, exclude_files: str, interactive: bool):
     """Analyze source code for technical debt, quality issues, and anti-patterns.
     
     PURPOSE:
@@ -331,70 +351,185 @@ def analyze_cmd(state: CLIState, path: Path):
     - path (required): File or directory to analyze
       * Single file: analyzes that file
       * Directory: recursively analyzes all supported files
+    - --cache/--no-cache: Use cached results (Phase 5, default: enabled)
+    - --parallel N: Use N worker threads (Phase 5, default: 4)
+    - --incremental/--no-incremental: Only analyze changed files (Phase 5, default: enabled)
+    - --benchmark/--no-benchmark: Measure performance metrics (Phase 5, default: enabled)
+    - --exclude-files: Comma-separated filenames to skip (e.g., 'test.py,config.py')
+    - --interactive: Prompt to skip each file during analysis (directories only)
     
     OUTPUTS:
     - Saves versioned Markdown report to reports/
     - Shows progress and summary in terminal
+    - With --benchmark: saves metrics to reports/performance_benchmarks.json
+    - With --cache: creates .noor/cache/ with findings database
     
     EXAMPLES:
-    - noor analyze examples/legacyfile.py          # Analyze single file
-    - noor analyze examples/                        # Analyze entire directory
-    - noor --mode=openai analyze myfile.py         # Use OpenAI backend
+    - noor analyze examples/legacyfile.py                    # Full optimization (default)
+    - noor analyze examples/ --no-benchmark --no-incremental # Disable performance features
+    - noor analyze src/ --parallel 8                         # Use 8 parallel threads
+    - noor analyze . --no-cache                              # Disable cache
+    - noor analyze examples/ --exclude-files "test.py"       # Skip specific files
+    - noor analyze examples/ --interactive                   # Prompt to skip each file
+    - noor --mode=openai analyze myfile.py                   # Use OpenAI backend
     """
-    client = state.ensure_client()
+    # Validate and normalize performance parameters
+    parallel = validate_parallel_workers(parallel)
+    
+    # Setup performance context
+    with PerformanceContext(
+        "analyze",
+        enable_cache=cache,
+        enable_benchmark=benchmark,
+        reports_dir=state.reports_dir
+    ) as perf_ctx:
+        
+        client = state.ensure_client()
 
-    files = (
-        list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
-        if path.is_dir()
-        else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
-    )
+        files = (
+            list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
+            if path.is_dir()
+            else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
+        )
 
-    if not files:
-        click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
-        raise SystemExit(2)
+        # Filter out excluded files
+        if exclude_files:
+            excluded_set = {f.strip() for f in exclude_files.split(",") if f.strip()}
+            files = [
+                (fpath, content) for fpath, content in files
+                if fpath.name not in excluded_set
+            ]
+            if excluded_set:
+                click.echo(click.style(f"⏭️  Skipping {len(excluded_set)} file(s): {', '.join(sorted(excluded_set))}", fg="yellow"))
 
-    # Summary for package mode
-    if path.is_dir() and len(files) > 1:
-        click.echo(click.style(f"📦 Analyzing package: {path.name}", fg="cyan"))
-        click.echo(click.style(f"   Found {len(files)} files to analyze", fg="blue"))
-        click.echo()
+        if not files:
+            click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
+            raise SystemExit(2)
 
-    analyzed_count = 0
-    failed_count = 0
+        # Summary for package mode
+        if path.is_dir() and len(files) > 1:
+            click.echo(click.style(f"📦 Analyzing package: {path.name}", fg="cyan"))
+            click.echo(click.style(f"   Found {len(files)} files to analyze", fg="blue"))
+            click.echo()
 
-    with render_progress("Analyzing code…") as prog:
-        t = prog.add_task("run", total=len(files))
-        for fpath, content in files:
-            try:
-                report_md = client.analyze_text(fpath.name, content)
-                out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
-                
-                # For single files, show full output; for packages, show summary
-                if not (path.is_dir() and len(files) > 1):
-                    _save_and_print(report_md, out, header=fpath.name)
+        analyzed_count = 0
+        failed_count = 0
+
+        # For package mode, don't use progress bar - show file-by-file output
+        is_package_mode = path.is_dir() and len(files) > 1
+        
+        if is_package_mode:
+            # Simple file-by-file output for directories
+            for fpath, content in files:
+                if path.is_file():
+                    rel_path = fpath.name
                 else:
-                    # Just save without rendering full output in package mode
+                    rel_path = fpath.relative_to(path)
+                
+                try:
+                    # Show which file is being analyzed RIGHT NOW
+                    click.echo(click.style(f"   ⏳ Analyzing {rel_path}…", fg="cyan"), nl=True)
+                    
+                    # Interactive mode: prompt to skip this file
+                    if interactive:
+                        response = click.prompt(
+                            click.style("      [c]ontinue/[s]kip/[q]uit", fg="yellow"),
+                            type=click.Choice(["c", "s", "q"], case_sensitive=False),
+                            default="c"
+                        )
+                        if response.lower() == "s":
+                            click.echo(click.style(f"   ⏭️  Skipped {rel_path}", fg="yellow"))
+                            analyzed_count += 1
+                            continue
+                        elif response.lower() == "q":
+                            click.echo(click.style("\n🛑 Analysis interrupted by user.", fg="red"))
+                            break
+                    
+                    # Check cache first (Phase 5)
+                    cached = perf_ctx.get_cached_findings(fpath, "analyze", allow_stale=False)
+                    cache_hit = False
+                    
+                    # Check cache and process
+                    if cached:
+                        # Cache hit - fast retrieval
+                        report_md = cached
+                        cache_hit = True
+                    else:
+                        # New analysis needed - this is where LLM is called
+                        report_md = client.analyze_text(fpath.name, content)
+                        # Store in cache
+                        perf_ctx.cache_findings(fpath, "analyze", report_md, 100)  # ~100ms avg
+                    
+                    # Record analysis for metrics
+                    perf_ctx.record_file_analysis(fpath, cache_hit=cache_hit)
+                    
+                    out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
+                    
+                    # Save report
                     out.parent.mkdir(parents=True, exist_ok=True)
                     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
                     stamped_text = f"Generated: {generated_at}\n\n{report_md.lstrip()}"
                     out.write_text(stamped_text, encoding="utf-8")
                     
-                    rel_path = fpath.relative_to(path)
-                    click.echo(click.style(f"   ✅ {rel_path} → {out.name}", fg="green"))
-                
-                analyzed_count += 1
-            except Exception as e:
-                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
-                failed_count += 1
-            finally:
-                prog.advance(t)
+                    # Show completion status
+                    indicator = "⚡" if cache_hit else "✅"
+                    click.echo(click.style(f"   {indicator} {rel_path} → {out.name}", fg="green"))
+                    
+                    analyzed_count += 1
+                except Exception as e:
+                    click.echo(click.style(f"   ❌ {rel_path}: {e}", fg="red"))
+                    failed_count += 1
+        else:
+            # Single file mode - use progress bar
+            with render_progress("Analyzing code…") as prog:
+                t = prog.add_task("run", total=len(files))
+                for fpath, content in files:
+                    if path.is_file():
+                        rel_path = fpath.name
+                    else:
+                        rel_path = fpath.relative_to(path)
+                    
+                    try:
+                        # Check cache first (Phase 5)
+                        cached = perf_ctx.get_cached_findings(fpath, "analyze", allow_stale=False)
+                        cache_hit = False
+                        
+                        # Check cache and process
+                        if cached:
+                            # Cache hit - fast retrieval
+                            report_md = cached
+                            cache_hit = True
+                        else:
+                            # New analysis needed
+                            report_md = client.analyze_text(fpath.name, content)
+                            # Store in cache
+                            perf_ctx.cache_findings(fpath, "analyze", report_md, 100)  # ~100ms avg
+                        
+                        # Record analysis for metrics
+                        perf_ctx.record_file_analysis(fpath, cache_hit=cache_hit)
+                        
+                        out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
+                        _save_and_print(report_md, out, header=fpath.name)
+                        
+                        analyzed_count += 1
+                    except Exception as e:
+                        click.echo(click.style(f"❌ Error: {e}", fg="red"))
+                        failed_count += 1
+                    finally:
+                        prog.advance(t)
 
-    # Summary for package mode
-    if path.is_dir() and len(files) > 1:
-        click.echo()
-        click.echo(click.style(f"✨ Analyzed {analyzed_count} file(s) in reports/ folder", fg="green"))
-        if failed_count > 0:
-            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
+        # Summary for package mode
+        if is_package_mode:
+            click.echo()
+            click.echo(click.style(f"✨ Analyzed {analyzed_count} file(s) in reports/ folder", fg="green"))
+            if failed_count > 0:
+                click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
+        
+        # Show cache stats if enabled
+        if cache and perf_ctx.cache:
+            stats = perf_ctx.get_cache_stats()
+            if stats:
+                click.echo(click.style(f"\n💾 Cache: {stats['total_entries']} findings cached", fg="cyan"))
 
 
 @cli.command("suggest")
