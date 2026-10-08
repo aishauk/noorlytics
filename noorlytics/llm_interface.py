@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -118,9 +119,21 @@ class LLMClient:
         self.ollama_api_url = S.ollama_api_url
         self.ollama_base = S.ollama_base
         self.keep_alive = S.keep_alive
+        
+        # Cache directory for refactor plans (Issue 2: Redundant LLM Calls)
+        # Unified with other caches under .noor/cache/
+        self.cache_dir = Path(".noor/cache") / "refactor_cache"
+        self._model_warmed = False
 
-    def warmup(self) -> None:
-        """Optional warmup call to reduce first-call latency."""
+    def warmup(self) -> bool:
+        """Optional warmup call to reduce first-call latency (Issue 3: Ollama Model Loading).
+        
+        Returns:
+            True if warmup succeeded, False otherwise
+        """
+        if self._model_warmed:
+            return True
+            
         if self.mode == "ollama":
             try:
                 # Fetch tags to wake the daemon, then send a short keepalive message.
@@ -133,10 +146,56 @@ class LLMClient:
                     "options": {"temperature": 0.0, "num_predict": 1},
                 }
                 net.session().post(self.ollama_api_url, json=payload, timeout=5.0)
+                self._model_warmed = True
+                return True
             except Exception:
-                pass
+                return False
         else:
-            return
+            self._model_warmed = True
+            return True
+
+    def _get_cache_key(self, content: str) -> str:
+        """Generate a cache key from content hash."""
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def _load_from_cache(self, cache_key: str) -> Optional[str]:
+        """Load cached refactor plan if it exists (Issue 2: Redundant LLM Calls)."""
+        if not self.cache_dir.exists():
+            return None
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text())
+                return data.get("plan")
+            except Exception:
+                return None
+        return None
+    
+    def _save_to_cache(self, cache_key: str, plan: str) -> None:
+        """Save refactor plan to cache (Issue 2: Redundant LLM Calls)."""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = self.cache_dir / f"{cache_key}.json"
+            cache_file.write_text(json.dumps({"plan": plan}, indent=2, ensure_ascii=False))
+        except Exception:
+            pass  # Silently fail on cache write errors
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Backward-compatible wrapper around the chat-based interface."""
+        client = self if model is None or model == self.model else LLMClient(mode=self.mode, model=model)
+        return client.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens or self.analyze_num_predict,
+        )
 
     def chat(
         self,
@@ -336,8 +395,40 @@ class LLMClient:
         
         return '\n'.join(result)
 
+    def cached_refactor(self, filename: str, content: str) -> str:
+        """Generate or retrieve cached refactoring plan for content (Issue 2: Redundant LLM Calls).
+        
+        Checks cache first before calling LLM, saving 20-50s per file on re-runs.
+        This is the preferred method for refactoring analysis.
+        
+        Args:
+            filename: Name of the file being refactored
+            content: Source code content to analyze
+            
+        Returns:
+            Refactoring plan in Markdown format
+        """
+        cache_key = self._get_cache_key(content)
+        
+        # Try to load from cache
+        cached_plan = self._load_from_cache(cache_key)
+        if cached_plan:
+            return cached_plan
+        
+        # Generate new plan
+        plan = self.refactor(filename, content)
+        
+        # Save to cache
+        self._save_to_cache(cache_key, plan)
+        
+        return plan
+
     def refactor(self, filename: str, content: str) -> str:
-        """Generate detailed refactoring implementation plan with step-by-step guidance."""
+        """Generate detailed refactoring implementation plan with step-by-step guidance.
+        
+        Note: Use cached_refactor() instead to benefit from plan caching and avoid
+        redundant LLM calls when analyzing the same code multiple times.
+        """
         sys = (
             "You are an expert code refactoring architect. Your goal is to create a detailed, "
             "ACTIONABLE refactoring implementation plan that a developer can execute with confidence.\n\n"

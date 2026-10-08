@@ -1,0 +1,17 @@
+{
+  "customer_name": "Default Company",
+  "industry": "general",
+  "deployment": "cloud",
+  "risk_preferences": {
+    "security": "high",
+    "business_continuity": "medium",
+    "cost_control": "medium",
+    "delivery_speed": "medium"
+  },
+  "constraints": {
+    "upgrade_window_days": 30,
+    "requires_oss_license_review": false,
+    "legacy_runtime": null,
+    "min_security_score": 75
+  }
+}

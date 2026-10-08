@@ -18,3 +18,9 @@ setuptools
 typing-extensions
 
 rich
+
+# CLI utilities
+tabulate
+
+# Performance monitoring
+psutil
