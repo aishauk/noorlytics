@@ -13,6 +13,8 @@ from typing import List, Optional, Dict, Set
 from enum import Enum
 import re
 import keyword
+import ast
+import textwrap
 
 
 class ChangePriority(Enum):
@@ -71,6 +73,8 @@ class RefactorChange:
     estimated_impact: Dict[str, str]  # {'readability': 'high', 'performance': 'low', ...}
     breakage_points: str
     depends_on: str = "None"  # Dependency description (e.g., "Change 1: Rename function")
+    application_status: str = "not_requested"
+    application_reason: str = ""
     
     def is_safe(self) -> bool:
         """Determine if this change is safe to apply automatically.
@@ -86,6 +90,17 @@ class RefactorChange:
             True if both code blocks appear complete, False if either is truncated
         """
         return not (_is_code_truncated(self.before_code) or _is_code_truncated(self.after_code))
+
+    def is_cosmetic_only(self) -> bool:
+        """Identify identical edits or formatting-only changes to executable Python."""
+        if self.before_code.strip() == self.after_code.strip():
+            return True
+        try:
+            before = ast.parse(textwrap.dedent(self.before_code))
+            after = ast.parse(textwrap.dedent(self.after_code))
+        except SyntaxError:
+            return False
+        return ast.dump(before) == ast.dump(after)
 
     @staticmethod
     def _extract_defined_symbol(code: str) -> tuple[str, str] | None:
@@ -303,7 +318,7 @@ class RefactorPlanParser:
         Falls back to detecting refactoring sections by heuristics (Before/After code blocks).
         """
         # Pattern: [HIGH/MEDIUM/LOW] at start of line, continue until next priority marker or end
-        pattern = r"\n(\[(?:HIGH|MEDIUM|LOW)\].*?)(?=\n\[(?:HIGH|MEDIUM|LOW)\]|\Z)"
+        pattern = r"(?:^|\n)(\[(?:HIGH|MEDIUM|LOW)\].*?)(?=\n\[(?:HIGH|MEDIUM|LOW)\]|\Z)"
         blocks = re.findall(pattern, self.markdown, re.DOTALL)
         
         # Also check if the markdown starts with a priority marker (no leading newline)

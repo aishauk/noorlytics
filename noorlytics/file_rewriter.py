@@ -14,6 +14,9 @@ import shutil
 from datetime import datetime
 import re
 import keyword
+import io
+import tokenize
+import ast
 
 
 class FileRewriter:
@@ -45,6 +48,7 @@ class FileRewriter:
         
         self.current_content = self.original_content
         self.changes_applied: List[Tuple[str, str]] = []  # (before, after) pairs
+        self.last_failure_reason = ""
     
     def _normalize_code(self, code: str) -> str:
         """Normalize code for flexible matching.
@@ -170,6 +174,19 @@ class FileRewriter:
         normalized_target = self._normalize_code(target_code)
         if not normalized_target:
             return None
+        def matching_tree(code):
+            tree = ast.parse(self._remove_indentation(code))
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+                    first = node.body[0]
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                        node.body = node.body[1:]
+            return ast.dump(tree)
+
+        try:
+            target_tree = matching_tree(target_code)
+        except SyntaxError:
+            target_tree = None
 
         target_lines = [line.strip() for line in target_code.split('\n') if line.strip()]
         target_first_line = target_lines[0] if target_lines else ""
@@ -186,6 +203,13 @@ class FileRewriter:
                 candidate_lines = [line.strip() for line in candidate.split('\n') if line.strip()]
                 if not candidate_lines:
                     continue
+                if target_tree:
+                    try:
+                        candidate_tree = matching_tree(candidate)
+                    except SyntaxError:
+                        candidate_tree = None
+                    if candidate_tree == target_tree:
+                        return candidate
                 if candidate_lines[0] != target_first_line or candidate_lines[-1] != target_last_line:
                     continue
                 if self._normalize_code(candidate) == normalized_target:
@@ -256,6 +280,20 @@ class FileRewriter:
 
     def _apply_identifier_renames(self, code: str, replacements: list[tuple[str, str]]) -> str:
         """Apply word-boundary identifier replacements to a code snippet."""
+        if self.source_file.suffix == ".py":
+            rename_map = dict(replacements)
+            lines = code.splitlines(keepends=True)
+            edits = []
+            try:
+                for token in tokenize.generate_tokens(io.StringIO(code).readline):
+                    if token.type == tokenize.NAME and token.string in rename_map:
+                        edits.append((token.start, token.end, rename_map[token.string]))
+            except (tokenize.TokenError, IndentationError):
+                return code
+            for start, end, replacement in reversed(edits):
+                line_idx = start[0] - 1
+                lines[line_idx] = lines[line_idx][:start[1]] + replacement + lines[line_idx][end[1]:]
+            return ''.join(lines)
         rebased_code = code
         for old_name, new_name in replacements:
             rebased_code = re.sub(rf'\b{re.escape(old_name)}\b', new_name, rebased_code)
@@ -286,6 +324,8 @@ class FileRewriter:
         before_symbols = self._extract_defined_symbol_names(before_code)
         after_symbols = self._extract_defined_symbol_names(after_code)
         if not before_symbols or not after_symbols:
+            return []
+        if len(before_symbols) != len(after_symbols):
             return []
 
         renamed_symbols: list[tuple[str, str]] = []
@@ -381,6 +421,8 @@ class FileRewriter:
             return None
 
         matched_block = self._find_enclosing_python_block(concrete_before, content)
+        if not matched_block:
+            matched_block = self._find_enclosing_python_block(concrete_after, content)
         if not matched_block:
             return None
 
@@ -492,6 +534,40 @@ class FileRewriter:
         
         Returns the modified content if successful, None if no match found.
         """
+        try:
+            before_tree = ast.parse(self._remove_indentation(before_code))
+            after_tree = ast.parse(self._remove_indentation(after_code))
+        except SyntaxError:
+            before_tree = after_tree = None
+        if before_tree and after_tree and len(before_tree.body) == len(after_tree.body) == 1:
+            before_class, after_class = before_tree.body[0], after_tree.body[0]
+            if isinstance(before_class, ast.ClassDef) and isinstance(after_class, ast.ClassDef) and before_class.name == after_class.name:
+                live_block = self._find_named_python_block(before_class.name, content)
+                if live_block:
+                    try:
+                        live_class = ast.parse(self._remove_indentation(live_block)).body[0]
+                    except SyntaxError:
+                        live_class = None
+                    method_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+                    before_methods = [node for node in before_class.body if isinstance(node, method_types)]
+                    after_methods = [node for node in after_class.body if isinstance(node, method_types)]
+                    live_names = {node.name for node in live_class.body if isinstance(node, method_types)} if live_class else set()
+                    if live_names - {node.name for node in before_methods}:
+                        if len(before_methods) != len(after_methods) or not before_methods:
+                            return None
+                        updated_content = content
+                        for before_method, after_method in zip(before_methods, after_methods):
+                            before_lines = self._remove_indentation(before_code).splitlines()
+                            after_lines = self._remove_indentation(after_code).splitlines()
+                            original_method = self._remove_indentation('\n'.join(before_lines[before_method.lineno - 1:before_method.end_lineno]))
+                            replacement_method = self._remove_indentation('\n'.join(after_lines[after_method.lineno - 1:after_method.end_lineno]))
+                            updated_block = self._apply_change_with_flexible_match(original_method, replacement_method, live_block)
+                            if updated_block is None:
+                                return None
+                            updated_content = updated_content.replace(live_block, updated_block, 1)
+                            live_block = updated_block
+                        return updated_content
+
         if self._contains_placeholder_markers(before_code) or self._contains_placeholder_markers(after_code):
             renamed_block_content = self._apply_placeholder_renames_within_block(
                 before_code,
@@ -525,6 +601,7 @@ class FileRewriter:
 
                 if applied_any_chunk:
                     return updated_content
+            return None
         
         # 1. Try exact match first
         if before_code in content:
@@ -558,6 +635,59 @@ class FileRewriter:
         
         return None
     
+    def _python_contract_error(self, original_code: str, updated_code: str, renames: dict[str, str]) -> str | None:
+        """Conservatively reject contract changes that require behavioral evidence."""
+        try:
+            original_tree = ast.parse(original_code)
+            updated_tree = ast.parse(updated_code)
+        except SyntaxError as error:
+            return f"Python syntax validation failed: {error.msg}"
+
+        def functions(tree):
+            result = {}
+
+            def visit(container, prefix=""):
+                for node in container.body:
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                        name = prefix + node.name
+                        if not isinstance(node, ast.ClassDef):
+                            result[name] = node
+                        visit(node, name + ".")
+
+            visit(tree)
+            return result
+
+        def body_nodes(function):
+            nodes = []
+
+            def visit(node):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    return
+                nodes.append(node)
+                for child in ast.iter_child_nodes(node):
+                    visit(child)
+
+            for statement in function.body:
+                visit(statement)
+            return nodes
+
+        updated_functions = functions(updated_tree)
+        for name, original in functions(original_tree).items():
+            updated_name = '.'.join(renames.get(part, part) for part in name.split('.'))
+            updated = updated_functions.get(updated_name)
+            if updated is None:
+                return f"Refactor removes existing function/method `{name}`; requires explicit migration and tests"
+            signature = self._apply_identifier_renames(ast.unparse(original.args), list(renames.items()))
+            if signature != ast.unparse(updated.args) or type(original) is not type(updated):
+                return f"Refactor changes signature or async contract of `{name}`; requires tests"
+            original_nodes = body_nodes(original)
+            updated_nodes = body_nodes(updated)
+            is_generator = lambda nodes: any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in nodes)
+            if is_generator(original_nodes) != is_generator(updated_nodes):
+                return f"Refactor changes generator/return contract of `{name}`; requires tests"
+
+        return None
+
     def apply_change(self, before_code: str, after_code: str, validate: bool = True) -> bool:
         """Apply a single change to the file.
         
@@ -569,6 +699,7 @@ class FileRewriter:
         Returns:
             True if change was applied, False otherwise
         """
+        self.last_failure_reason = ""
         if not before_code:
             return False
 
@@ -576,18 +707,73 @@ class FileRewriter:
         new_content = self._apply_change_with_flexible_match(before_code, after_code, self.current_content)
 
         if new_content is None or new_content == self.current_content:
-            rebased_before = self._find_rebased_before_code(before_code, after_code)
+            rebased_snippet = before_code
+            rebased_after = after_code
+            for previous_before, previous_after in self.changes_applied:
+                replacements = self._extract_identifier_renames(previous_before, previous_after)
+                rebased_snippet = self._apply_identifier_renames(rebased_snippet, replacements)
+                rebased_after = self._apply_identifier_renames(rebased_after, replacements)
+            if rebased_snippet != before_code:
+                new_content = self._apply_change_with_flexible_match(rebased_snippet, rebased_after, self.current_content)
+                if new_content is not None:
+                    applied_before = rebased_snippet
+
+        if new_content is None or new_content == self.current_content:
+            rebased_before = None if self.source_file.suffix == ".py" or self._contains_placeholder_markers(after_code) else self._find_rebased_before_code(before_code, after_code)
             if rebased_before:
                 new_content = self._apply_change_with_flexible_match(rebased_before, after_code, self.current_content)
                 applied_before = rebased_before
 
         if new_content is None or new_content == self.current_content:
             # No actual change made or no match found
+            self.last_failure_reason = "Before snippet does not match the staged source; refusing an ungrounded replacement"
             return False
 
         symbol_renames = self._infer_symbol_renames(before_code, after_code)
         for old_name, new_name in symbol_renames:
             new_content = self._apply_identifier_renames(new_content, [(old_name, new_name)])
+
+        if self.source_file.suffix == ".py":
+            try:
+                def dictionary_keys(code):
+                    return {
+                        node.slice.value
+                        for node in ast.walk(ast.parse(self._remove_indentation(code)))
+                        if isinstance(node, ast.Subscript)
+                        and isinstance(node.slice, ast.Constant)
+                        and isinstance(node.slice.value, str)
+                    }
+
+                removed_keys = dictionary_keys(before_code) - dictionary_keys(after_code)
+                remaining_keys = removed_keys & dictionary_keys(new_content)
+                if remaining_keys:
+                    self.last_failure_reason = "Dictionary key change leaves existing readers unchanged: " + ", ".join(sorted(remaining_keys))
+                    return False
+            except SyntaxError:
+                pass
+            inferred_renames = self._extract_identifier_renames(before_code, after_code)
+            renamed_before = self._apply_identifier_renames(before_code, inferred_renames)
+            contract_renames = dict(inferred_renames) if self._normalize_code(renamed_before) == self._normalize_code(after_code) else {}
+            contract_renames.update(symbol_renames)
+            contract_error = self._python_contract_error(self.current_content, new_content, contract_renames)
+            if contract_error:
+                self.last_failure_reason = contract_error
+                return False
+            try:
+                original_tree = ast.parse(self.current_content)
+                updated_tree = ast.parse(new_content)
+            except SyntaxError:
+                return False
+            updated_classes = {
+                node.name: {member.name for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                for node in ast.walk(updated_tree) if isinstance(node, ast.ClassDef)
+            }
+            rename_map = dict(symbol_renames)
+            for node in ast.walk(original_tree):
+                if isinstance(node, ast.ClassDef):
+                    expected = {rename_map.get(member.name, member.name) for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                    if not expected <= updated_classes.get(rename_map.get(node.name, node.name), set()):
+                        return False
 
         # Validate by checking that the new content contains at least some key part of after_code
         # Since after_code may be indented when applied, we check for normalized versions
@@ -646,19 +832,43 @@ class FileRewriter:
                 successful += 1
                 continue
 
-            rebased_before = self._find_rebased_before_code(before_code, after_code)
-            if rebased_before and self.apply_change(rebased_before, after_code, validate=False):
+            rebased_before = None if self.source_file.suffix == ".py" else self._find_rebased_before_code(before_code, after_code)
+            if not self._contains_placeholder_markers(after_code) and rebased_before and self.apply_change(rebased_before, after_code, validate=False):
                 successful += 1
                 continue
 
             # Code not found - analyze why
             failed += 1
+
+            unchanged_symbols = self._extract_defined_symbol_names(before_code) & self._extract_defined_symbol_names(after_code)
+            current_symbols = self._extract_defined_symbol_names(self.current_content)
+            renamed_symbols = {
+                old_name
+                for previous_before, previous_after in self.changes_applied
+                for old_name, new_name in self._infer_symbol_renames(previous_before, previous_after)
+            }
+            missing_symbols = sorted(unchanged_symbols - current_symbols - renamed_symbols)
+            if missing_symbols:
+                failure_details[idx] = (
+                    "Before snippet assumes function/class definition(s) not present in the file: "
+                    + ", ".join(missing_symbols)
+                )
+                continue
+            if self.last_failure_reason:
+                failure_details[idx] = self.last_failure_reason
+                continue
                 
             # Check if it's due to undefined variables
             # First, strip docstrings and comments from before_code to avoid false positives
             code_without_docs = re.sub(r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|#.*$', '', before_code, flags=re.MULTILINE)
             
-            vars_in_before = set(re.findall(r'\b([a-z_][a-z0-9_]*)\b', code_without_docs, re.IGNORECASE))
+            vars_in_before = set()
+            try:
+                for token in tokenize.generate_tokens(io.StringIO(before_code).readline):
+                    if token.type == tokenize.NAME:
+                        vars_in_before.add(token.string)
+            except (tokenize.TokenError, IndentationError):
+                pass
             defined_in_before = self._extract_defined_names(code_without_docs)
             
             # Filter out Python keywords and common built-ins

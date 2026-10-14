@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import requests
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -18,6 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .settings import get_settings
 from . import net
+from .refactor_findings import DETECTOR_VERSION, collect_refactor_findings, finding_checklist, grounded_refactor_plan
 
 
 def _summarize_ollama_http_error(error: requests.exceptions.HTTPError) -> str:
@@ -118,9 +120,21 @@ class LLMClient:
         self.ollama_api_url = S.ollama_api_url
         self.ollama_base = S.ollama_base
         self.keep_alive = S.keep_alive
+        
+        # Cache directory for refactor plans (Issue 2: Redundant LLM Calls)
+        # Unified with other caches under .noor/cache/
+        self.cache_dir = Path(".noor/cache") / "refactor_cache"
+        self._model_warmed = False
 
-    def warmup(self) -> None:
-        """Optional warmup call to reduce first-call latency."""
+    def warmup(self) -> bool:
+        """Optional warmup call to reduce first-call latency (Issue 3: Ollama Model Loading).
+        
+        Returns:
+            True if warmup succeeded, False otherwise
+        """
+        if self._model_warmed:
+            return True
+            
         if self.mode == "ollama":
             try:
                 # Fetch tags to wake the daemon, then send a short keepalive message.
@@ -133,10 +147,56 @@ class LLMClient:
                     "options": {"temperature": 0.0, "num_predict": 1},
                 }
                 net.session().post(self.ollama_api_url, json=payload, timeout=5.0)
+                self._model_warmed = True
+                return True
             except Exception:
-                pass
+                return False
         else:
-            return
+            self._model_warmed = True
+            return True
+
+    def _get_cache_key(self, content: str) -> str:
+        """Generate a cache key from content hash."""
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def _load_from_cache(self, cache_key: str) -> Optional[str]:
+        """Load cached refactor plan if it exists (Issue 2: Redundant LLM Calls)."""
+        if not self.cache_dir.exists():
+            return None
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text())
+                return data.get("plan")
+            except Exception:
+                return None
+        return None
+    
+    def _save_to_cache(self, cache_key: str, plan: str) -> None:
+        """Save refactor plan to cache (Issue 2: Redundant LLM Calls)."""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = self.cache_dir / f"{cache_key}.json"
+            cache_file.write_text(json.dumps({"plan": plan}, indent=2, ensure_ascii=False))
+        except Exception:
+            pass  # Silently fail on cache write errors
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Backward-compatible wrapper around the chat-based interface."""
+        client = self if model is None or model == self.model else LLMClient(mode=self.mode, model=model)
+        return client.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens or self.analyze_num_predict,
+        )
 
     def chat(
         self,
@@ -336,13 +396,67 @@ class LLMClient:
         
         return '\n'.join(result)
 
+    def cached_refactor(self, filename: str, content: str, *, force_refresh: bool = False) -> str:
+        """Generate or retrieve cached refactoring plan for content (Issue 2: Redundant LLM Calls).
+        
+        Checks cache first before calling LLM, saving 20-50s per file on re-runs.
+        This is the preferred method for refactoring analysis.
+        
+        Args:
+            filename: Name of the file being refactored
+            content: Source code content to analyze
+            force_refresh: Ignore the stored plan and replace it after successful generation
+            
+        Returns:
+            Refactoring plan in Markdown format
+        """
+        cache_config = json.dumps({
+            "prompt_version": 4, "detector_version": DETECTOR_VERSION,
+            "filename": filename, "mode": self.mode, "model": self.model,
+            "temperature": self.temp_refactor, "max_tokens": self.refactor_num_predict,
+        }, sort_keys=True)
+        cache_key = self._get_cache_key(cache_config + "\n" + content)
+        
+        # Try to load from cache
+        if not force_refresh:
+            cached_plan = self._load_from_cache(cache_key)
+            if cached_plan:
+                return cached_plan
+        
+        # Generate new plan
+        plan = self.refactor(filename, content)
+        
+        # Save to cache
+        self._save_to_cache(cache_key, plan)
+        
+        return plan
+
     def refactor(self, filename: str, content: str) -> str:
-        """Generate detailed refactoring implementation plan with step-by-step guidance."""
+        """Generate detailed refactoring implementation plan with step-by-step guidance.
+        
+        Note: Use cached_refactor() instead to benefit from plan caching and avoid
+        redundant LLM calls when analyzing the same code multiple times.
+        """
+        findings = collect_refactor_findings(filename, content)
+        checklist = finding_checklist(findings)
         sys = (
             "You are an expert code refactoring architect. Your goal is to create a detailed, "
             "ACTIONABLE refactoring implementation plan that a developer can execute with confidence.\n\n"
             "🔴 CRITICAL INSTRUCTION:\n"
-            "When you show 'Before:' code, you MUST copy-paste EXACTLY from the input file.\n"
+            "For the first change, 'Before:' code MUST match the input file EXACTLY.\n"
+            "For dependent changes, 'Before:' MUST match the staged file after earlier changes.\n"
+            "Use the current function and variable names after earlier renames.\n"
+            "Never invent existing code: a new helper belongs ONLY in 'After:', not 'Before:'.\n"
+            "Do not use ellipsis placeholders; include complete executable blocks.\n"
+            "Do not combine conflicting alternatives in one sequential plan.\n"
+            "Do not propose quote-style changes, whitespace-only edits, or identical before/after blocks.\n"
+            "Prioritize meaningful simplification and supplied findings, not cosmetic padding.\n"
+            "Review EVERY function and EVERY supplied finding in this single request.\n"
+            "For each supplied finding, either include its RF-ID in the Problem: line of a complete change,\n"
+            "or output 'Unresolved: RF-ID - reason' on its own line after all changes.\n"
+            "Do not silently omit findings. Additional findings may be included.\n"
+            "Review findings are not confirmed bugs: preserve behavior and state missing policy or assumptions.\n"
+            "Preserve dictionary keys and public interfaces unless every consumer is updated in the same change.\n"
             "Include ALL docstrings, comments, blank lines, and indentation exactly as they appear.\n"
             "Do NOT simplify, remove docstrings, or clean up the code in the 'Before' section.\n"
             "The exact match is needed for code substitution tools to work.\n\n"
@@ -415,7 +529,9 @@ class LLMClient:
         )
         user = (
             f"File: {filename}\n\n"
-            "⚠️  CRITICAL: When showing BEFORE code, copy-paste EXACTLY from the file above (including ALL docstrings, comments, and whitespace).\n"
+            "LOCAL FINDINGS CHECKLIST (address every ID, without extra model calls):\n"
+            f"{checklist or 'No supported local patterns detected; still review the entire file.'}\n\n"
+            "⚠️  CRITICAL: BEFORE code must match the current staged file, including earlier approved changes, docstrings, comments, and whitespace.\n"
             "Do NOT simplify, summarize, or remove docstrings. Use the EXACT code as it appears.\n\n"
             "📌 DEPENDENCY ANALYSIS REQUIRED:\n"
             "1. Identify which refactorings affect the same code elements (renames, variable updates, etc.)\n"
@@ -448,7 +564,7 @@ class LLMClient:
             max_tokens=self.refactor_num_predict,
         )
         # Post-process to ensure proper format for parser
-        return self._ensure_refactor_format(result)
+        return grounded_refactor_plan(filename, content, self._ensure_refactor_format(result))
 
     def generate_tests(self, filename: str, content: str, language_hint: str = "python") -> str:
         sys = (

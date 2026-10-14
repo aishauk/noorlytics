@@ -8,6 +8,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.python-version
 
 # OS
 .DS_Store
@@ -19,4 +20,11 @@ build/
 # Generated
 reports/
 tests/
+.noor/
 .noor_backups/
+.pytest_cache/
+.noorlytics/
+
+# Backend runtime
+backend/
+frontend/

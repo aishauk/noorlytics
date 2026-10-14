@@ -24,8 +24,10 @@ dependencies = [
   "python-dotenv",
   "requests",
   "rich",
+  "tabulate",
   "typing-extensions",
   "setuptools",
+  "psutil",
 ]
 
 [project.optional-dependencies]
