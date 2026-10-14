@@ -172,13 +172,16 @@ def _check_authentication(line: str, idx: int, filename: str) -> List[SecurityFi
         )
 
     # Check for weak password validation
-    if "len(password)" in lowered and "<" in lowered:
-        if re.search(r"len\(password\)\s*<\s*[0-8]", lowered):
+    if "len(password)" in lowered:
+        # Match both: len(password) < 8 AND len(password) >= 5 (and other weak patterns)
+        if re.search(r"len\(password\)\s*<\s*[0-8]", lowered) or \
+           re.search(r"len\(password\)\s*>\s*=[0-5]", lowered) or \
+           re.search(r"len\(password\)\s*>=\s*[0-5]", lowered):
             findings.append(
                 SecurityFinding(
                     check_type="authentication",
                     severity="high",
-                    message="Weak password length requirement (< 8 characters). Enforce minimum 12+ characters.",
+                    message="Weak password length requirement (< 8 characters or >= < 6). Enforce minimum 12+ characters.",
                     filename=filename,
                     line=idx,
                     evidence=line.strip(),
@@ -264,6 +267,11 @@ def _check_error_handling(lines: List[str], start_idx: int, filename: str) -> Li
     # Look for try-except patterns around security operations
     for idx in range(max(0, start_idx - 5), min(len(lines), start_idx + 10)):
         line = lines[idx].lower()
+        stripped = line.strip()
+        
+        # Skip function/class definitions - errors should be caught at call sites, not definitions
+        if stripped.startswith("def ") or stripped.startswith("class "):
+            continue
 
         if any(op in line for op in ["authenticate", "decrypt", "validate", "verify", "authorization", "permission"]):
             # Check if there's a try-except block

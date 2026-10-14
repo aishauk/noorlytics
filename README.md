@@ -64,20 +64,20 @@ export OPENAI_API_KEY="your-key"
 
 ### Dependency & Security Scanning
 
-| Command            | Purpose                                                                | Usage                                          |
-| ------------------ | ---------------------------------------------------------------------- | ---------------------------------------------- |
-| **analyze-deps**   | Check dependencies for vulnerabilities, licenses, compliance           | `noor analyze-deps requirements.txt --network` |
-| **gdpr**           | Scan for GDPR/privacy violations (PII logging, insecure data transfer) | `noor gdpr src/`                               |
-| **audit-security** | Audit code for encryption, logging, authentication, secrets handling   | `noor audit-security file.py --remediate`      |
-| **scan-standards** | Check compliance with HIPAA, PCI-DSS, SOC2, ISO27001, FedRAMP          | `noor scan-standards src/ --standard hipaa`    |
-| **unified-scan**   | Merge security and compliance findings into one report                 | `noor unified-scan .`                          |
+| Command            | Purpose                                                       | Usage                                               |
+| ------------------ | ------------------------------------------------------------- | --------------------------------------------------- |
+| **analyze-deps**   | Check dependencies for vulnerabilities + auto-upgrade         | `noor analyze-deps requirements.txt --auto-upgrade` |
+| **gdpr**           | Scan for GDPR/privacy violations + auto-remediate issues      | `noor gdpr src/ --auto-remediate`                   |
+| **audit-security** | Audit code for security issues + auto-fix                     | `noor audit-security file.py --auto-fix`            |
+| **scan-standards** | Check compliance with HIPAA, PCI-DSS, SOC2, ISO27001, FedRAMP | `noor scan-standards src/ --standard hipaa`         |
+| **unified-scan**   | Merge security and compliance findings into one report        | `noor unified-scan .`                               |
 
-### Cache Management (Phase 5)
+### Cache Management (Phase 5 & Phase C)
 
 | Command                | Purpose                                                   | Usage                                              |
 | ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
-| **cache stats**        | Show cache statistics and usage information               | `noor cache stats`                                 |
-| **cache clear**        | Clear all cached findings (with optional --confirm flag)  | `noor cache clear` or `noor cache clear --confirm` |
+| **cache stats**        | Show cache statistics (analysis + remediation)            | `noor cache stats`                                 |
+| **cache clear**        | Clear all cached findings and remediation results         | `noor cache clear` or `noor cache clear --confirm` |
 | **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
 | **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
 
@@ -138,7 +138,7 @@ noor scan-standards src/                         # All standards
 ```bash
 noor refactor file.py --dry-run                  # Preview changes
 noor refactor file.py --interactive              # Review each change
-noor refactor file.py --apply --git-commit       # Apply + commit to git
+noor refactor file.py --apply                    # Apply
 ```
 
 ### Workflow 5: Full Assessment & Decision Making
@@ -151,7 +151,7 @@ noor history show requirements.txt                      # Track changes over tim
 noor metrics dashboard --period 30                      # View trends
 ```
 
-### Workflow 6: Performance Optimization (Phase 5)
+### Workflow 6: Performance Optimization
 
 ```bash
 # Default: all performance features enabled (cache, benchmark, incremental)
@@ -172,6 +172,41 @@ noor cache clear      # Clear all cached findings
 noor cache info       # Detailed cache information
 ```
 
+### Workflow 7: Automated Remediation
+
+````bash
+# Security: Auto-fix encryption, auth, logging, secrets issues
+noor audit-security src/ --remediate --auto-fix              # Auto-apply all fixes
+noor audit-security src/ --remediate --auto-fix --interactive # Prompt for each fix
+
+# Dependencies: Auto-upgrade vulnerable/unpinned packages
+noor analyze-deps requirements.txt --auto-upgrade             # Auto-upgrade all
+noor analyze-deps requirements.txt --auto-upgrade --interactive # Prompt for each
+
+# Privacy: Auto-fix GDPR violations (PII logging, encryption)
+noor gdpr src/ --auto-remediate                               # Auto-apply all fixes
+noor gdpr src/ --auto-remediate --interactive                 # Prompt for each fix
+
+# All remediation uses automatic caching for 90%+ speedup on unchanged files
+# Cache stored in: .noor/cache/findings.db
+# First run: 10-23s | Subsequent runs: 1-2s (unchanged files: 0.1s)
+
+---
+
+### Workflow 8: Rollback Remediation Changes
+
+```bash
+# Undo the last remediation changes from backup
+noor audit-security src/ --undo                   # Restore previous security fixes
+noor analyze-deps requirements.txt --undo         # Restore previous dependency upgrades
+noor gdpr src/ --undo                             # Restore previous privacy fixes
+
+# All backups are stored with timestamps for easy recovery
+# Backup location: {path}/.noor_backups/
+# Backup naming: {filename}.YYYYMMDD_HHMMSS.bak
+# Example: app.py.20261008_143022.bak
+```
+
 ---
 
 ## 📊 Command Options Reference
@@ -183,7 +218,7 @@ noor cache info       # Detailed cache information
 --mode openai          # Use OpenAI API
 --help                 # Show command help
 --version              # Show CLI version
-```
+````
 
 ### Performance & Caching (Phase 5)
 
@@ -218,10 +253,10 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 ### analyze
 
 ```bash
---cache/--no-cache                        # Use cached findings (default: enabled, Phase 5)
---parallel N                              # Number of worker threads (default: 4, Phase 5)
---incremental/--no-incremental            # Only changed files (default: enabled, Phase 5)
---benchmark/--no-benchmark                # Measure performance (default: enabled, Phase 5)
+--cache/--no-cache                        # Use cached findings (default: enabled)
+--parallel N                              # Number of worker threads (default: 4)
+--incremental/--no-incremental            # Only changed files (default: enabled)
+--benchmark/--no-benchmark                # Measure performance (default: enabled)
 ```
 
 ### refactor
@@ -232,6 +267,7 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 --interactive (-i)     # Prompt for confirmation before each change
 --undo (-u)            # Restore previous refactoring from backup
 --git-commit (-gc)     # Auto-commit changes to git after applying
+--cache/--no-cache     # Use cached findings (default: enabled)
 ```
 
 ### add-tests
@@ -245,6 +281,9 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 ```bash
 --offline              # Use only local data (no network lookup)
 --network              # Allow live registry & security checks
+--auto-upgrade (-u)    # Auto-upgrade vulnerable/unpinned dependencies
+--interactive (-i)     # Prompt before upgrading each dependency
+--undo                 # Restore from backup
 ```
 
 ### audit-security
@@ -255,10 +294,13 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 --check authentication       # Check only auth issues
 --check secrets              # Check only secrets/credentials
 --check all                  # Check everything (default)
---remediate (-r)             # Generate LLM-powered remediation
---cache/--no-cache           # Use cached results (Phase 5, default: enabled)
---parallel N                 # Number of worker threads (Phase 5, default: 4)
---benchmark                  # Measure performance metrics (Phase 5)
+--remediate (-r)             # Generate LLM-powered remediation suggestions
+--auto-fix (-f)              # Auto-apply fixes directly to source (requires --remediate)
+--interactive (-i)           # Prompt before applying each fix
+--undo                       # Restore from backup
+--cache/--no-cache           # Use cached results (default: enabled, 90%+ speedup)
+--parallel N                 # Number of worker threads (default: 4)
+--benchmark                  # Measure performance metrics
 ```
 
 ### scan-standards
@@ -270,11 +312,19 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 --standard iso27001          # ISO 27001 only
 --standard fedramp           # FedRAMP only
 --standard all               # All standards (default)
---remediate (-r)             # Generate LLM-powered remediation
+--remediate (-r)             # Generate LLM-powered remediation guidance
 --cache/--no-cache           # Use cached results (default: enabled)
 --parallel N                 # Number of worker threads (default: 4)
---incremental                # Only analyze changed files (Phase 5)
---benchmark                  # Measure performance metrics (Phase 5)
+--incremental                # Only analyze changed files
+--benchmark                  # Measure performance metrics
+```
+
+### gdpr
+
+```bash
+--auto-remediate (-a)  # Auto-apply privacy fixes (remove PII, add encryption)
+--interactive (-i)     # Prompt before applying each fix
+--undo                 # Restore from backup
 ```
 
 ### assess
@@ -339,19 +389,24 @@ noor metrics by-category                     # Group by category
 
 All results are saved to `reports/` directory:
 
-| Output                         | Description                   |
-| ------------------------------ | ----------------------------- |
-| `{filename}.analyze.v1.md`     | Code analysis findings        |
-| `{filename}.suggest.v1.md`     | Refactoring suggestions       |
-| `{filename}.refactor.v1.md`    | Detailed refactor plan        |
-| `{filename}.v1.md`             | Unit tests generated          |
-| `{filename}.deps.json`         | Dependency analysis (JSON)    |
-| `gdpr_findings.json`           | GDPR violations               |
-| `audit_security_findings.json` | Security audit results        |
-| `compliance_findings.json`     | Standards compliance issues   |
-| `{filename}.assess.json`       | Business decisions (JSON)     |
-| `{filename}.assess.v1.md`      | Business decisions (Markdown) |
-| `decisions.db`                 | Decision history database     |
+| Output                                | Description                               |
+| ------------------------------------- | ----------------------------------------- |
+| `{filename}.analyze.v1.md`            | Code analysis findings                    |
+| `{filename}.suggest.v1.md`            | Refactoring suggestions                   |
+| `{filename}.refactor.v1.md`           | Detailed refactor plan                    |
+| `{filename}.v1.md`                    | Unit tests generated                      |
+| `{filename}.deps.json`                | Dependency analysis (JSON)                |
+| `gdpr_findings.json`                  | GDPR violations                           |
+| `audit_security_findings.json`        | Security audit results                    |
+| `audit_security_autofix_results.json` | Auto-fixed security issues (Phase C)      |
+| `gdpr_remediation_results.json`       | Auto-fixed privacy issues (Phase C)       |
+| `{manifest}.upgrade_results.json`     | Auto-upgraded dependencies (Phase C)      |
+| `compliance_findings.json`            | Standards compliance issues               |
+| `{filename}.assess.json`              | Business decisions (JSON)                 |
+| `{filename}.assess.v1.md`             | Business decisions (Markdown)             |
+| `decisions.db`                        | Decision history database                 |
+| `.noor/cache/findings.db`             | Remediation & analysis cache (Phase C/5)  |
+| `.noor_cache/file_hashes.json`        | File hash tracking for cache invalidation |
 
 ---
 
@@ -416,6 +471,63 @@ noor --mode=openai analyze file.py
 4. **Track progress:** `noor history show requirements.txt` to see improvement over time
 5. **Export results:** Use `--export-format json` to integrate with other tools
 6. **Git integration:** Add `--git-commit` to auto-commit refactoring changes
+7. **Auto-remediate:** Use `--auto-fix`, `--auto-upgrade`, `--auto-remediate` flags (Phase C)
+8. **Check backups:** Remediation creates `.noor_backups/` for safe rollback
+9. **Cache speedup:** Subsequent runs are 90%+ faster with automatic caching
+10. **Interactive mode:** Use `-i` flag to review each fix before applying
+
+---
+
+## 🔄 Phase C: Automated Remediation (NEW!)
+
+**Problem Solved:** Convert from "suggestions-only" to "automatic fixes" reducing fix-cycle from weeks to days.
+
+### Quick Start
+
+```bash
+# Auto-fix security issues (creates backups, uses caching)
+noor audit-security src/ --remediate --auto-fix
+
+# Auto-upgrade dependencies with validation
+noor analyze-deps requirements.txt --auto-upgrade
+
+# Auto-remediate privacy violations
+noor gdpr src/ --auto-remediate
+
+# Interactive mode: review each fix before applying
+noor audit-security src/ --remediate --auto-fix --interactive
+noor analyze-deps requirements.txt --auto-upgrade --interactive
+noor gdpr src/ --auto-remediate --interactive
+```
+
+### Results Saved
+
+- `audit_security_autofix_results.json` - Security fixes applied with details
+- `{manifest}.upgrade_results.json` - Dependencies upgraded with versions
+- `gdpr_remediation_results.json` - Privacy fixes applied with status
+- `.noor_backups/` - All backups with timestamps (YYYYMMDD_HHMMSS.bak)
+- `.noor/cache/findings.db` - Cache of all remediation results
+- `.noor/cache/file_hashes.json` - File hash tracking for cache invalidation
+
+### Advanced Usage
+
+```bash
+# Disable caching if needed (rare)
+noor audit-security src/ --remediate --auto-fix --no-cache
+
+# Parallel processing with remediation
+noor audit-security src/ --remediate --auto-fix --parallel 4
+
+# Benchmark remediation performance
+noor audit-security src/ --remediate --auto-fix --benchmark
+
+# View remediation cache statistics
+noor cache stats
+
+# Clear remediation cache and re-run
+noor cache clear --confirm
+noor audit-security src/ --remediate --auto-fix
+```
 
 ---
 

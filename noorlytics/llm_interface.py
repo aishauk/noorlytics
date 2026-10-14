@@ -19,6 +19,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .settings import get_settings
 from . import net
+from .refactor_findings import DETECTOR_VERSION, collect_refactor_findings, finding_checklist, grounded_refactor_plan
 
 
 def _summarize_ollama_http_error(error: requests.exceptions.HTTPError) -> str:
@@ -395,7 +396,7 @@ class LLMClient:
         
         return '\n'.join(result)
 
-    def cached_refactor(self, filename: str, content: str) -> str:
+    def cached_refactor(self, filename: str, content: str, *, force_refresh: bool = False) -> str:
         """Generate or retrieve cached refactoring plan for content (Issue 2: Redundant LLM Calls).
         
         Checks cache first before calling LLM, saving 20-50s per file on re-runs.
@@ -404,16 +405,23 @@ class LLMClient:
         Args:
             filename: Name of the file being refactored
             content: Source code content to analyze
+            force_refresh: Ignore the stored plan and replace it after successful generation
             
         Returns:
             Refactoring plan in Markdown format
         """
-        cache_key = self._get_cache_key(content)
+        cache_config = json.dumps({
+            "prompt_version": 4, "detector_version": DETECTOR_VERSION,
+            "filename": filename, "mode": self.mode, "model": self.model,
+            "temperature": self.temp_refactor, "max_tokens": self.refactor_num_predict,
+        }, sort_keys=True)
+        cache_key = self._get_cache_key(cache_config + "\n" + content)
         
         # Try to load from cache
-        cached_plan = self._load_from_cache(cache_key)
-        if cached_plan:
-            return cached_plan
+        if not force_refresh:
+            cached_plan = self._load_from_cache(cache_key)
+            if cached_plan:
+                return cached_plan
         
         # Generate new plan
         plan = self.refactor(filename, content)
@@ -429,11 +437,26 @@ class LLMClient:
         Note: Use cached_refactor() instead to benefit from plan caching and avoid
         redundant LLM calls when analyzing the same code multiple times.
         """
+        findings = collect_refactor_findings(filename, content)
+        checklist = finding_checklist(findings)
         sys = (
             "You are an expert code refactoring architect. Your goal is to create a detailed, "
             "ACTIONABLE refactoring implementation plan that a developer can execute with confidence.\n\n"
             "🔴 CRITICAL INSTRUCTION:\n"
-            "When you show 'Before:' code, you MUST copy-paste EXACTLY from the input file.\n"
+            "For the first change, 'Before:' code MUST match the input file EXACTLY.\n"
+            "For dependent changes, 'Before:' MUST match the staged file after earlier changes.\n"
+            "Use the current function and variable names after earlier renames.\n"
+            "Never invent existing code: a new helper belongs ONLY in 'After:', not 'Before:'.\n"
+            "Do not use ellipsis placeholders; include complete executable blocks.\n"
+            "Do not combine conflicting alternatives in one sequential plan.\n"
+            "Do not propose quote-style changes, whitespace-only edits, or identical before/after blocks.\n"
+            "Prioritize meaningful simplification and supplied findings, not cosmetic padding.\n"
+            "Review EVERY function and EVERY supplied finding in this single request.\n"
+            "For each supplied finding, either include its RF-ID in the Problem: line of a complete change,\n"
+            "or output 'Unresolved: RF-ID - reason' on its own line after all changes.\n"
+            "Do not silently omit findings. Additional findings may be included.\n"
+            "Review findings are not confirmed bugs: preserve behavior and state missing policy or assumptions.\n"
+            "Preserve dictionary keys and public interfaces unless every consumer is updated in the same change.\n"
             "Include ALL docstrings, comments, blank lines, and indentation exactly as they appear.\n"
             "Do NOT simplify, remove docstrings, or clean up the code in the 'Before' section.\n"
             "The exact match is needed for code substitution tools to work.\n\n"
@@ -506,7 +529,9 @@ class LLMClient:
         )
         user = (
             f"File: {filename}\n\n"
-            "⚠️  CRITICAL: When showing BEFORE code, copy-paste EXACTLY from the file above (including ALL docstrings, comments, and whitespace).\n"
+            "LOCAL FINDINGS CHECKLIST (address every ID, without extra model calls):\n"
+            f"{checklist or 'No supported local patterns detected; still review the entire file.'}\n\n"
+            "⚠️  CRITICAL: BEFORE code must match the current staged file, including earlier approved changes, docstrings, comments, and whitespace.\n"
             "Do NOT simplify, summarize, or remove docstrings. Use the EXACT code as it appears.\n\n"
             "📌 DEPENDENCY ANALYSIS REQUIRED:\n"
             "1. Identify which refactorings affect the same code elements (renames, variable updates, etc.)\n"
@@ -539,7 +564,7 @@ class LLMClient:
             max_tokens=self.refactor_num_predict,
         )
         # Post-process to ensure proper format for parser
-        return self._ensure_refactor_format(result)
+        return grounded_refactor_plan(filename, content, self._ensure_refactor_format(result))
 
     def generate_tests(self, filename: str, content: str, language_hint: str = "python") -> str:
         sys = (

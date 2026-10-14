@@ -19,6 +19,7 @@ PII_PATTERNS = (
     "card_number",
     "full_name",
     "name",
+    "id",  # User identifiers should be masked
 )
 
 

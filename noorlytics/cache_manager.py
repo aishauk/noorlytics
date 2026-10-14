@@ -109,12 +109,15 @@ class FileHashCache:
 class FindingsCache:
     """SQLite-backed cache for analysis findings."""
     
-    def __init__(self, cache_dir: Path = Path(".noor/cache")):
+    def __init__(self, cache_dir: Path = Path(".noor/cache"), enable_cache: bool = True):
         self.cache_dir = cache_dir
+        self.enable_cache = enable_cache
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = cache_dir / "findings.db"
+        self.llm_cache_path = cache_dir / "llm_responses.json"
         self._init_db()
         self.file_hash_cache = FileHashCache(cache_dir)
+        self._llm_responses = self._load_llm_responses()
     
     def _init_db(self) -> None:
         """Initialize SQLite database schema."""
@@ -145,6 +148,22 @@ class FindingsCache:
         finally:
             conn.close()
     
+    def _load_llm_responses(self) -> Dict[str, str]:
+        """Load cached LLM responses from disk."""
+        if self.llm_cache_path.exists():
+            try:
+                return json.loads(self.llm_cache_path.read_text())
+            except Exception as e:
+                logger.warning(f"Failed to load LLM responses cache: {e}")
+        return {}
+    
+    def _save_llm_responses(self) -> None:
+        """Save LLM responses cache to disk."""
+        try:
+            self.llm_cache_path.write_text(json.dumps(self._llm_responses, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to save LLM responses cache: {e}")
+    
     def get(
         self,
         file_path: Path,
@@ -162,20 +181,24 @@ class FindingsCache:
         Returns:
             Cached findings or None if not found or stale
         """
-        if not allow_stale and self.file_hash_cache.has_changed(file_path):
-            return None  # File changed, cache is stale
+        if not self.enable_cache:
+            return None  # Caching disabled
         
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(
                 """
-                SELECT findings_json FROM findings_cache
+                SELECT findings_json, file_hash FROM findings_cache
                 WHERE file_path = ? AND analysis_type = ?
                 """,
                 (str(file_path.resolve()), analysis_type)
             )
             row = cursor.fetchone()
             if row:
+                if not allow_stale:
+                    current_hash = self.file_hash_cache._compute_file_hash(file_path)
+                    if not current_hash or current_hash != row[1]:
+                        return None
                 return json.loads(row[0])
         except Exception as e:
             logger.warning(f"Cache retrieval failed: {e}")
@@ -200,6 +223,9 @@ class FindingsCache:
             findings: Analysis findings dictionary
             execution_time_ms: Time taken to generate findings
         """
+        if not self.enable_cache:
+            return  # Caching disabled
+        
         try:
             path_resolved = str(file_path.resolve())
             file_hash = self.file_hash_cache._compute_file_hash(file_path)
@@ -307,6 +333,32 @@ class FindingsCache:
             if path.is_file():
                 total += path.stat().st_size
         return total
+    
+    def get_findings(self, file_path: Path, analysis_type: str) -> Optional[list]:
+        """Get cached findings as a list."""
+        cached = self.get(file_path, analysis_type)
+        if cached and isinstance(cached, dict) and "findings" in cached:
+            return cached["findings"]
+        elif cached and isinstance(cached, list):
+            return cached
+        return None
+    
+    def save_findings(self, file_path: Path, analysis_type: str, findings: list, execution_time_ms: float = 0) -> None:
+        """Save findings to cache."""
+        self.set(file_path, analysis_type, {"findings": findings}, execution_time_ms)
+    
+    def get_llm_response(self, finding_id: str) -> Optional[str]:
+        """Get cached LLM response for a finding."""
+        if not self.enable_cache:
+            return None  # Caching disabled
+        return self._llm_responses.get(finding_id)
+    
+    def save_llm_response(self, finding_id: str, response: str) -> None:
+        """Cache an LLM response."""
+        if not self.enable_cache:
+            return  # Caching disabled
+        self._llm_responses[finding_id] = response
+        self._save_llm_responses()
 
 
 # Global cache instance
