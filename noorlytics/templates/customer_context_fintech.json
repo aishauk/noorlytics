@@ -1,0 +1,17 @@
+{
+  "customer_name": "FinTech Startup",
+  "industry": "fintech",
+  "deployment": "customer-facing",
+  "risk_preferences": {
+    "security": "high",
+    "business_continuity": "medium",
+    "cost_control": "high",
+    "delivery_speed": "high"
+  },
+  "constraints": {
+    "upgrade_window_days": 7,
+    "requires_oss_license_review": false,
+    "legacy_runtime": null,
+    "min_security_score": 7
+  }
+}

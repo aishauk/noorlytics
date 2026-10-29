@@ -4,13 +4,16 @@ from __future__ import annotations
 import os
 import json
 import re
+import subprocess
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, UTC
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Tuple, Optional, List
 
 import click
+from rich.progress import TextColumn
 
 from noorlytics.settings import get_settings
 from noorlytics.llm_interface import LLMClient, render_progress, render_markdown_cli
@@ -18,11 +21,36 @@ from noorlytics.analyze_dependencies import (
     analyze_dependencies_file,
     render_notes_cli,
     render_vulns_cli,
+    transform_analysis_to_findings,
+)
+from noorlytics.findings import FindingsCollection, FindingType
+from noorlytics.assessment import (
+    AssessmentEngine,
+    CustomerContext,
 )
 from noorlytics.add_tests import generate_unit_tests, render_tests_cli, _detect_language_from_extension
+from noorlytics.gdpr import scan_gdpr_violations
+from noorlytics.audit_security import scan_audit_security
+from noorlytics.scan_standards import scan_standards, check_dependency_standards
+from noorlytics.unified_scan import UnifiedScanner, FindingCategory
 from noorlytics.refactor_executor import RefactorPlanParser, DependencyGraph
+from noorlytics.refactor_findings import DETECTOR_VERSION, collect_refactor_findings, plan_coverage
 from noorlytics.file_rewriter import FileRewriter, BackupManager
 from noorlytics.git_integration import GitIntegration
+
+# Import new CLI modules for Phase 3
+from noorlytics.cli.decisions import decisions
+from noorlytics.cli.history import history
+from noorlytics.cli.metrics import metrics
+
+# Import Phase 5: Performance & CLI Integration
+from noorlytics.cli.performance_integration import (
+    PerformanceContext,
+    CLICommandBuilder,
+    validate_parallel_workers,
+    format_file_analysis_result,
+)
+from noorlytics.cli.cache_commands import cache
 
 # -------------------- Constants --------------------
 
@@ -32,6 +60,10 @@ DEFAULT_IGNORE_DIRS = {
 }
 
 CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=100)
+
+# Default template path (relative to noorlytics package)
+_PACKAGE_DIR = Path(__file__).parent.parent  # noorlytics/cli/ -> noorlytics/
+DEFAULT_TEMPLATE_PATH = _PACKAGE_DIR / "templates" / "customer_context_default.json"
 
 
 # -------------------- CLI State --------------------
@@ -130,6 +162,8 @@ def _find_conflicting_symbol_changes(changes: List) -> List[Tuple[int, int, str]
         left = changes[i]
         left_before = _extract_defined_symbol_name(left.before_code)
         left_after = _extract_defined_symbol_name(left.after_code)
+        left_symbols = set(re.findall(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", left.before_code, re.MULTILINE))
+        left_after_symbols = set(re.findall(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", left.after_code, re.MULTILINE))
 
         if not left_before:
             continue
@@ -142,10 +176,20 @@ def _find_conflicting_symbol_changes(changes: List) -> List[Tuple[int, int, str]
             if not right_before:
                 continue
 
-            if left_before != right_before:
+            if _has_real_dependency(getattr(left, 'depends_on', None)) or _has_real_dependency(getattr(right, 'depends_on', None)):
                 continue
 
-            if _has_real_dependency(getattr(left, 'depends_on', None)) or _has_real_dependency(getattr(right, 'depends_on', None)):
+            right_symbols = set(re.findall(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", right.before_code, re.MULTILINE))
+            right_after_symbols = set(re.findall(r"^\s*(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b", right.after_code, re.MULTILINE))
+            shared_symbols = left_symbols & right_symbols
+            removed_symbols = (left_symbols - left_after_symbols) | (right_symbols - right_after_symbols)
+            if len(left_symbols) > 1 or len(right_symbols) > 1:
+                for symbol in sorted(shared_symbols & removed_symbols):
+                    conflicts.append((i, j, symbol))
+                if shared_symbols & removed_symbols:
+                    continue
+
+            if left_before != right_before:
                 continue
 
             if left_after and right_after and left_after != right_after:
@@ -254,8 +298,9 @@ def _render_change_code_block(change, indent: str = "         ") -> None:
 # -------------------- CLI Root --------------------
 
 @click.group(context_settings=CONTEXT_SETTINGS)
-@click.option("--mode", type=click.Choice(["ollama", "openai"]), default=None,
-              help="Choose LLM backend. If omitted, uses .env/settings value.")
+@click.option("--mode", type=click.Choice(["ollama", "openai"]), 
+              default=os.getenv("NOOR_MODE", "ollama"),
+              help="Choose LLM backend. Default: ollama (from NOOR_MODE env var).")
 @click.version_option(package_name="noorlytics", prog_name="noor")
 @click.pass_context
 def cli(ctx: click.Context, mode: Optional[str]):
@@ -291,74 +336,244 @@ def cli(ctx: click.Context, mode: Optional[str]):
         verbose=False,  # verbose tas bort som option → sätt default
     )
 
+# -------------------- Phase 5: Cache Management Commands --------------------
+
+# Add the cache command group
+cli.add_command(cache)
+
 # -------------------- Commands --------------------
 
 @cli.command("analyze")
-@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory path to analyze")
+@click.option("--cache/--no-cache", default=True, help="Use cached findings from previous runs (Phase 5)")
+@click.option("--parallel", type=int, default=4, help="Number of worker threads (0=auto-detect, Phase 5)")
+@click.option("--incremental/--no-incremental", default=True, help="Only analyze changed files (Phase 5, default: enabled)")
+@click.option("--benchmark/--no-benchmark", default=True, help="Measure and track performance metrics (Phase 5, default: enabled)")
+@click.option("--exclude-files", type=str, default="", help="Comma-separated filenames to skip (e.g., 'test.py,config.py')")
+@click.option("--interactive/--no-interactive", default=False, help="Prompt to skip each file before analyzing (interactive mode)")
 @click.pass_obj
-def analyze_cmd(state: CLIState, path: Path):
-    """Analyze technical debt in a file or directory (package)."""
-    client = state.ensure_client()
+def analyze_cmd(state: CLIState, path: Path, cache: bool, parallel: int, incremental: bool, benchmark: bool, exclude_files: str, interactive: bool):
+    """Analyze source code for technical debt, quality issues, and anti-patterns.
+    
+    PURPOSE:
+    Scans code for potential improvements including:
+    - Code quality issues
+    - Performance problems
+    - Security concerns
+    - Maintainability issues
+    
+    PARAMETERS:
+    - path (required): File or directory to analyze
+      * Single file: analyzes that file
+      * Directory: recursively analyzes all supported files
+    - --cache/--no-cache: Use cached results (Phase 5, default: enabled)
+    - --parallel N: Use N worker threads (Phase 5, default: 4)
+    - --incremental/--no-incremental: Only analyze changed files (Phase 5, default: enabled)
+    - --benchmark/--no-benchmark: Measure performance metrics (Phase 5, default: enabled)
+    - --exclude-files: Comma-separated filenames to skip (e.g., 'test.py,config.py')
+    - --interactive: Prompt to skip each file during analysis (directories only)
+    
+    OUTPUTS:
+    - Saves versioned Markdown report to reports/
+    - Shows progress and summary in terminal
+    - With --benchmark: saves metrics to reports/performance_benchmarks.json
+    - With --cache: creates .noor/cache/ with findings database
+    
+    EXAMPLES:
+    - noor analyze examples/legacyfile.py                    # Full optimization (default)
+    - noor analyze examples/ --no-benchmark --no-incremental # Disable performance features
+    - noor analyze src/ --parallel 8                         # Use 8 parallel threads
+    - noor analyze . --no-cache                              # Disable cache
+    - noor analyze examples/ --exclude-files "test.py"       # Skip specific files
+    - noor analyze examples/ --interactive                   # Prompt to skip each file
+    - noor --mode=openai analyze myfile.py                   # Use OpenAI backend
+    """
+    # Validate and normalize performance parameters
+    parallel = validate_parallel_workers(parallel)
+    
+    # Setup performance context
+    with PerformanceContext(
+        "analyze",
+        enable_cache=cache,
+        enable_benchmark=benchmark,
+        reports_dir=state.reports_dir
+    ) as perf_ctx:
+        
+        client = state.ensure_client()
 
-    files = (
-        list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
-        if path.is_dir()
-        else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
-    )
+        files = (
+            list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
+            if path.is_dir()
+            else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
+        )
 
-    if not files:
-        click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
-        raise SystemExit(2)
+        # Filter out excluded files
+        if exclude_files:
+            excluded_set = {f.strip() for f in exclude_files.split(",") if f.strip()}
+            files = [
+                (fpath, content) for fpath, content in files
+                if fpath.name not in excluded_set
+            ]
+            if excluded_set:
+                click.echo(click.style(f"⏭️  Skipping {len(excluded_set)} file(s): {', '.join(sorted(excluded_set))}", fg="yellow"))
 
-    # Summary for package mode
-    if path.is_dir() and len(files) > 1:
-        click.echo(click.style(f"📦 Analyzing package: {path.name}", fg="cyan"))
-        click.echo(click.style(f"   Found {len(files)} files to analyze", fg="blue"))
-        click.echo()
+        if not files:
+            click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
+            raise SystemExit(2)
 
-    analyzed_count = 0
-    failed_count = 0
+        # Summary for package mode
+        if path.is_dir() and len(files) > 1:
+            click.echo(click.style(f"📦 Analyzing package: {path.name}", fg="cyan"))
+            click.echo(click.style(f"   Found {len(files)} files to analyze", fg="blue"))
+            click.echo()
 
-    with render_progress("Analyzing code…") as prog:
-        t = prog.add_task("run", total=len(files))
-        for fpath, content in files:
-            try:
-                report_md = client.analyze_text(fpath.name, content)
-                out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
-                
-                # For single files, show full output; for packages, show summary
-                if not (path.is_dir() and len(files) > 1):
-                    _save_and_print(report_md, out, header=fpath.name)
+        analyzed_count = 0
+        failed_count = 0
+
+        # For package mode, don't use progress bar - show file-by-file output
+        is_package_mode = path.is_dir() and len(files) > 1
+        
+        if is_package_mode:
+            # Simple file-by-file output for directories
+            for fpath, content in files:
+                if path.is_file():
+                    rel_path = fpath.name
                 else:
-                    # Just save without rendering full output in package mode
+                    rel_path = fpath.relative_to(path)
+                
+                try:
+                    # Show which file is being analyzed RIGHT NOW
+                    click.echo(click.style(f"   ⏳ Analyzing {rel_path}…", fg="cyan"), nl=True)
+                    
+                    # Interactive mode: prompt to skip this file
+                    if interactive:
+                        response = click.prompt(
+                            click.style("      [c]ontinue/[s]kip/[q]uit", fg="yellow"),
+                            type=click.Choice(["c", "s", "q"], case_sensitive=False),
+                            default="c"
+                        )
+                        if response.lower() == "s":
+                            click.echo(click.style(f"   ⏭️  Skipped {rel_path}", fg="yellow"))
+                            analyzed_count += 1
+                            continue
+                        elif response.lower() == "q":
+                            click.echo(click.style("\n🛑 Analysis interrupted by user.", fg="red"))
+                            break
+                    
+                    # Check cache first (Phase 5)
+                    cached = perf_ctx.get_cached_findings(fpath, "analyze", allow_stale=False)
+                    cache_hit = False
+                    
+                    # Check cache and process
+                    if cached:
+                        # Cache hit - fast retrieval
+                        report_md = cached
+                        cache_hit = True
+                    else:
+                        # New analysis needed - this is where LLM is called
+                        report_md = client.analyze_text(fpath.name, content)
+                        # Store in cache
+                        perf_ctx.cache_findings(fpath, "analyze", report_md, 100)  # ~100ms avg
+                    
+                    # Record analysis for metrics
+                    perf_ctx.record_file_analysis(fpath, cache_hit=cache_hit)
+                    
+                    out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
+                    
+                    # Save report
                     out.parent.mkdir(parents=True, exist_ok=True)
                     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
                     stamped_text = f"Generated: {generated_at}\n\n{report_md.lstrip()}"
                     out.write_text(stamped_text, encoding="utf-8")
                     
-                    rel_path = fpath.relative_to(path)
-                    click.echo(click.style(f"   ✅ {rel_path} → {out.name}", fg="green"))
-                
-                analyzed_count += 1
-            except Exception as e:
-                click.echo(click.style(f"   ❌ {fpath.relative_to(path)}: {e}", fg="red"))
-                failed_count += 1
-            finally:
-                prog.advance(t)
+                    # Show completion status
+                    indicator = "⚡" if cache_hit else "✅"
+                    click.echo(click.style(f"   {indicator} {rel_path} → {out.name}", fg="green"))
+                    
+                    analyzed_count += 1
+                except Exception as e:
+                    click.echo(click.style(f"   ❌ {rel_path}: {e}", fg="red"))
+                    failed_count += 1
+        else:
+            # Single file mode - use progress bar
+            with render_progress("Analyzing code…") as prog:
+                t = prog.add_task("run", total=len(files))
+                for fpath, content in files:
+                    if path.is_file():
+                        rel_path = fpath.name
+                    else:
+                        rel_path = fpath.relative_to(path)
+                    
+                    try:
+                        # Check cache first (Phase 5)
+                        cached = perf_ctx.get_cached_findings(fpath, "analyze", allow_stale=False)
+                        cache_hit = False
+                        
+                        # Check cache and process
+                        if cached:
+                            # Cache hit - fast retrieval
+                            report_md = cached
+                            cache_hit = True
+                        else:
+                            # New analysis needed
+                            report_md = client.analyze_text(fpath.name, content)
+                            # Store in cache
+                            perf_ctx.cache_findings(fpath, "analyze", report_md, 100)  # ~100ms avg
+                        
+                        # Record analysis for metrics
+                        perf_ctx.record_file_analysis(fpath, cache_hit=cache_hit)
+                        
+                        out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.analyze")
+                        _save_and_print(report_md, out, header=fpath.name)
+                        
+                        analyzed_count += 1
+                    except Exception as e:
+                        click.echo(click.style(f"❌ Error: {e}", fg="red"))
+                        failed_count += 1
+                    finally:
+                        prog.advance(t)
 
-    # Summary for package mode
-    if path.is_dir() and len(files) > 1:
-        click.echo()
-        click.echo(click.style(f"✨ Analyzed {analyzed_count} file(s) in reports/ folder", fg="green"))
-        if failed_count > 0:
-            click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
+        # Summary for package mode
+        if is_package_mode:
+            click.echo()
+            click.echo(click.style(f"✨ Analyzed {analyzed_count} file(s) in reports/ folder", fg="green"))
+            if failed_count > 0:
+                click.echo(click.style(f"   {failed_count} file(s) failed", fg="yellow"))
+        
+        # Show cache stats if enabled
+        if cache and perf_ctx.cache:
+            stats = perf_ctx.get_cache_stats()
+            if stats:
+                click.echo(click.style(f"\n💾 Cache: {stats['total_entries']} findings cached", fg="cyan"))
 
 
 @cli.command("suggest")
-@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory to suggest improvements for")
 @click.pass_obj
 def suggest_cmd(state: CLIState, path: Path):
-    """Generate improvement and refactoring suggestions for file or package."""
+    """Generate specific refactoring suggestions to improve code.
+    
+    PURPOSE:
+    Creates actionable refactor recommendations including:
+    - Code simplification ideas
+    - Design pattern suggestions
+    - Performance optimization opportunities
+    - Best practice recommendations
+    
+    PARAMETERS:
+    - path (required): File or directory for suggestions
+      * Single file: generates suggestions for that file
+      * Directory: recursively suggests for all supported files
+    
+    OUTPUTS:
+    - Saves versioned Markdown report to reports/
+    - Displays suggested changes with rationale
+    
+    EXAMPLES:
+    - noor suggest examples/legacyfile.py          # Suggestions for one file
+    - noor suggest examples/                        # Suggestions for package
+    - noor --mode=ollama suggest mycode.py         # Use local Ollama
+    """
     client = state.ensure_client()
 
     files = (
@@ -423,7 +638,33 @@ def suggest_cmd(state: CLIState, path: Path):
               help="Programming language. If omitted, auto-detects from file extension.")
 @click.pass_obj
 def add_tests_cmd(state: CLIState, path: Path, lang: str):
-    """Generate unit test stubs for a file or directory (package)."""
+    """Generate comprehensive unit test stubs for improved code coverage.
+    
+    PURPOSE:
+    Create test skeleton files with test cases for:
+    - All public functions and methods
+    - Edge cases and error conditions
+    - Integration points
+    - Performance scenarios
+    
+    PARAMETERS:
+    - path (required): File or directory to generate tests for
+      * Single file: generates tests for that file
+      * Directory: generates tests for all files in package
+    - --lang: Programming language (python, js, ts, java, go, etc.)
+      * Auto-detects from file extension if omitted
+      * Useful if extension doesn't match language
+    
+    OUTPUTS:
+    - New test files in tests/ directory (or alongside source)
+    - One test file per source file
+    - Framework-appropriate test structure
+    
+    EXAMPLES:
+    - noor add-tests examples/legacyfile.py         # Generate tests
+    - noor add-tests src/                           # Tests for package
+    - noor add-tests file.js --lang javascript      # Specify language
+    """
     # Collect all candidate files (handles both single files and entire packages)
     candidates = (
         sorted([p for p in path.rglob("*")
@@ -478,11 +719,73 @@ def add_tests_cmd(state: CLIState, path: Path, lang: str):
 
 @cli.command("analyze-deps")
 @click.argument("manifest", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--offline",
+    "allow_network",
+    flag_value=False,
+    default=False,
+    help="Use only local metadata and local lockfiles. No registry or OSV calls are made.",
+)
+@click.option(
+    "--network",
+    "allow_network",
+    flag_value=True,
+    help="Allow live registry and OSV lookups for package metadata and advisories.",
+)
+@click.option("--auto-upgrade", "-u", is_flag=True, help="Auto-upgrade dependencies to safe versions")
+@click.option("--interactive", "-i", is_flag=True, help="Prompt before upgrading each dependency")
+@click.option("--undo", is_flag=True, help="Restore previous dependency changes from backup")
 @click.pass_obj
-def analyze_deps_cmd(state: CLIState, manifest: Path):
-    """Analyze a dependency manifest (requirements.txt, pyproject.toml, package.json)."""
-    client = state.ensure_client()
-    result = analyze_dependencies_file(manifest, client)
+def analyze_deps_cmd(state: CLIState, manifest: Path, allow_network: bool, auto_upgrade: bool, interactive: bool, undo: bool):
+    """Analyze dependencies for security vulnerabilities and license risks.
+    
+    PURPOSE:
+    Scan package manifests for:
+    - Known security vulnerabilities in dependencies
+    - License compatibility issues
+    - Outdated package versions
+    - Dependency conflicts
+    - Supply chain risks
+    
+    PARAMETERS:
+    - manifest (required): Dependency file to analyze
+      * requirements.txt: Python pip dependencies
+      * pyproject.toml: Modern Python packaging
+      * package.json: JavaScript/Node.js packages
+      * pom.xml: Java Maven dependencies
+      * Gemfile: Ruby dependencies
+      * go.mod: Go modules
+    - --offline: Use only local data (no registry lookups)
+    - --network: Allow live registry and security advisory lookups
+    - --auto-upgrade / -u: Auto-upgrade vulnerable and unpinned dependencies
+      * Updates to safe, compatible versions
+      * Creates backups before modifications
+      * Validates with tests when possible
+      * Use --interactive to prompt before each upgrade
+    - --interactive / -i: Prompt before upgrading each dependency
+    
+    OUTPUTS:
+    - Vulnerability list with severity levels
+    - License risk assessment
+    - Findings JSON file (reports/)
+    - Remediation recommendations
+    - With --auto-upgrade: updated manifest file and upgrade report
+    
+    EXAMPLES:
+    - noor analyze-deps requirements.txt             # Analyze Python
+    - noor analyze-deps package.json                 # Analyze Node.js
+    - noor analyze-deps requirements.txt --network   # With live lookups
+    - noor analyze-deps pyproject.toml --offline     # Offline mode
+    - noor analyze-deps requirements.txt --auto-upgrade  # Auto-upgrade deps
+    - noor analyze-deps requirements.txt --auto-upgrade --interactive  # Prompt for each
+    - noor analyze-deps requirements.txt --undo  # Restore from backup
+    """
+    # Handle --undo flag
+    if undo:
+        _undo_remediation(manifest)
+        return
+
+    result = analyze_dependencies_file(manifest, allow_network=allow_network)
 
     # result är en dict med bl.a.:
     # - "notes_sections": {"Risks": [...], "Suggestions": [...]}
@@ -507,12 +810,1177 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
     out_json.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     click.echo(click.style(f"📝  Dependency JSON report saved → {out_json}", fg="green", bold=True))
 
-    # 4) (Valfritt men nice) – spara en Markdown-rapport också
+    # 4) Transform to normalized verified findings
+    findings_collection = transform_analysis_to_findings(result)
+    out_findings_json = state.reports_dir / f"{manifest.name}.findings.json"
+    findings_collection.to_json_file(str(out_findings_json))
+    
+    # Show findings statistics
+    stats = findings_collection.stats()
+    click.echo(click.style(f"\n✓ Verified Findings Generated:", fg="cyan", bold=True))
+    click.echo(f"  Total findings: {stats['total']}")
+    if stats['by_type']:
+        for ftype, count in stats['by_type'].items():
+            click.echo(f"    - {ftype}: {count}")
+    click.echo(click.style(f"📋  Findings JSON saved → {out_findings_json}", fg="green", bold=True))
+
+    # 5) (Valfritt men nice) – spara en Markdown-rapport också
     notes_md = result.get("notes_md")
     if notes_md:
         out_md = _next_versioned_markdown_path(state.reports_dir, f"{manifest.name}.deps")
         _save_and_print(notes_md, out_md, header=f"{manifest.name} – dependencies")
 
+    # 6) ---- Standards Compliance Check ----
+    standards_compliance = result.get("standards_compliance") or []
+    if standards_compliance:
+        click.echo("")
+        click.echo(click.style("⚠️  Standards Compliance Issues Detected:", fg="yellow", bold=True))
+        
+        by_standard = {}
+        for issue in standards_compliance:
+            std = issue["standard"]
+            if std not in by_standard:
+                by_standard[std] = []
+            by_standard[std].append(issue)
+        
+        for std in sorted(by_standard.keys()):
+            issues = by_standard[std]
+            click.echo(click.style(f"\n  {std.upper()} ({len(issues)} issue(s)):", fg="yellow"))
+            for issue in issues:
+                click.echo(
+                    f"    - {issue['package']} "
+                    f"[{issue['severity'].upper()}]: {issue['message']}"
+                )
+                click.echo(f"      Remediation: {issue['remediation']}")
+        
+        # Save compliance findings
+        out_compliance_json = state.reports_dir / f"{manifest.name}.compliance.json"
+        out_compliance_json.write_text(json.dumps(standards_compliance, indent=2, ensure_ascii=False), encoding="utf-8")
+        click.echo(click.style(f"\n📝 Compliance findings saved → {out_compliance_json}", fg="green", bold=True))
+    else:
+        click.echo(click.style("\n✓ No standards compliance issues detected for dependencies.", fg="green"))
+
+    # Auto-upgrade dependencies if requested
+    if auto_upgrade:
+        click.echo(click.style("\n🔧 Auto-upgrading dependencies...", fg="cyan", bold=True))
+        from noorlytics.remediation_engine import DependencyRemediator
+
+        # Build upgrade findings from the original analysis result
+        upgrade_findings = []
+        
+        # Add vulnerable packages
+        for vuln in result.get("known_vulns", []):
+            upgrade_findings.append({
+                "finding_type": "vulnerability",
+                "package": vuln.get("name", "unknown"),
+                "name": vuln.get("name", "unknown"),
+                "version": vuln.get("version"),
+                "severity": vuln.get("severity", "medium"),
+                "recommended_version": vuln.get("fix_version"),
+                "latest_version": vuln.get("fix_version"),
+            })
+        
+        # Add unpinned dependencies
+        for dep in result.get("dependencies", []):
+            if not dep.get("version"):
+                upgrade_findings.append({
+                    "finding_type": "unpinned_dependency",
+                    "package": dep.get("name", "unknown"),
+                    "name": dep.get("name", "unknown"),
+                    "version": None,
+                    "severity": "low",
+                })
+        
+        # Add legacy dependencies (dotnet)
+        if result.get("ecosystem") == "dotnet":
+            for dep in result.get("dependencies", []):
+                version = dep.get("version", "")
+                if version and re.match(r"^[0-3]\.", str(version)):
+                    upgrade_findings.append({
+                        "finding_type": "legacy_dependency",
+                        "package": dep.get("name", "unknown"),
+                        "name": dep.get("name", "unknown"),
+                        "version": version,
+                        "severity": "medium",
+                    })
+
+        if not upgrade_findings:
+            click.echo(click.style("✓ No upgradeable dependencies found.", fg="green"))
+        else:
+            remediator = DependencyRemediator(
+                cache_dir=Path.cwd() / ".noor" / "cache",
+                enable_cache=False  # Disable caching to ensure fresh upgrades
+            )
+            upgrade_results = remediator.auto_upgrade_dependencies(
+                manifest,
+                upgrade_findings,
+                interactive=interactive,
+                validate_with_tests=True,
+            )
+
+            # Display upgrade results
+            succeeded = sum(1 for r in upgrade_results if r.status.value == "success")
+            failed = sum(1 for r in upgrade_results if r.status.value == "failed")
+            skipped = sum(1 for r in upgrade_results if r.status.value == "skipped")
+
+            click.echo(click.style(f"\n✅ Dependency Upgrade Results:", fg="green", bold=True))
+            click.echo(f"  ✓ Succeeded: {succeeded}")
+            click.echo(f"  ⚠️  Failed:    {failed}")
+            click.echo(f"  ⊘ Skipped:   {skipped}")
+
+            # Save upgrade results
+            upgrade_json = state.reports_dir / f"{manifest.name}.upgrade_results.json"
+            upgrade_json.write_text(
+                json.dumps([r.to_dict() for r in upgrade_results], indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            click.echo(click.style(f"📝 Upgrade results saved → {upgrade_json}", fg="green", bold=True))
+
+            if failed > 0:
+                failed_results = [r for r in upgrade_results if r.status.value == "failed"]
+                _display_failed_remediations(failed_results, "Failed Dependency Upgrades")
+
+
+
+@cli.command("gdpr")
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory to scan for privacy risks")
+@click.option("--auto-remediate", "-a", is_flag=True, help="Auto-apply privacy fixes directly to source files")
+@click.option("--interactive", "-i", is_flag=True, help="Prompt before applying each privacy fix")
+@click.option("--undo", "-u", is_flag=True, help="Restore previous privacy fix changes from backup")
+@click.option("--no-cache", is_flag=True, help="Disable caching of findings (force fresh scan)")
+@click.pass_obj
+def gdpr_cmd(state: CLIState, path: Path, auto_remediate: bool, interactive: bool, undo: bool, no_cache: bool):
+    """Scan code for GDPR/privacy compliance issues and PII handling risks.
+    
+    PURPOSE:
+    Detects privacy violations including:
+    - Personal data being logged unsafely
+    - Insecure data transmission (HTTP instead of HTTPS)
+    - Missing data minimization/retention controls
+    - Unencrypted sensitive data storage
+    - Unauthorized data collection patterns
+    
+    PARAMETERS:
+    - path (required): File or directory to scan
+      * Single file: scans that file
+      * Directory: recursively scans all supported files
+    - --auto-remediate / -a: Automatically apply privacy fixes to source files
+      * Removes PII from logging statements
+      * Adds encryption where needed
+      * Creates backups before modifications
+      * Use --interactive to prompt before each fix
+    - --interactive / -i: Prompt before applying each privacy fix
+    
+    OUTPUTS:
+    - JSON findings file: reports/gdpr_findings.json
+    - Shows privacy issues with line numbers
+    - Provides remediation suggestions
+    - With --auto-remediate: applies fixes and saves results
+    
+    EXAMPLES:
+    - noor gdpr examples/legacyfile.py              # Scan single file
+    - noor gdpr src/                                # Scan entire codebase
+    - noor gdpr src/ --auto-remediate               # Auto-apply privacy fixes
+    - noor gdpr src/ --auto-remediate --interactive # Prompt before each fix
+    - noor gdpr src/ --undo                         # Restore from backup
+    """
+    # Handle --undo flag
+    if undo:
+        _undo_remediation(path)
+        return
+
+    files = (
+        list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
+        if path.is_dir()
+        else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
+    )
+
+    if not files:
+        click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
+        raise SystemExit(2)
+
+    # Initialize findings cache for GDPR findings
+    from noorlytics.cache_manager import FindingsCache
+    cache = FindingsCache(enable_cache=not no_cache)
+
+    all_findings = []
+    cached_count = 0
+    fresh_count = 0
+    
+    for fpath, content in files:
+        analysis_type = "gdpr"
+        
+        # Check cache first
+        cached_findings = cache.get_findings(fpath, analysis_type) if cache.enable_cache else None
+        
+        if cached_findings:
+            # Use cached findings
+            for item in cached_findings:
+                all_findings.append(item)
+            cached_count += 1
+            if state.verbose:
+                click.echo(click.style(f"  📦 {fpath} (cached)", fg="cyan"))
+        else:
+            # Fresh scan
+            findings_for_file = []
+            for item in scan_gdpr_violations(content, str(fpath)):
+                findings_for_file.append(item)
+                all_findings.append(item)
+            
+            # Cache findings
+            if findings_for_file and cache.enable_cache:
+                cache.save_findings(fpath, analysis_type, findings_for_file, execution_time_ms=0)
+            
+            fresh_count += 1
+            if state.verbose:
+                click.echo(click.style(f"  🔍 {fpath} (scanned)", fg="cyan"))
+
+    if not all_findings:
+        click.echo(click.style("✅ No GDPR/privacy-risk patterns detected.", fg="green"))
+        if cache.enable_cache:
+            click.echo(click.style(f"   (Cached: {cached_count}, Fresh: {fresh_count})", fg="white"))
+        return
+
+    click.echo(click.style("\n⚠️  GDPR/privacy-risk findings detected:", fg="red", bold=True))
+    for item in all_findings:
+        click.echo(
+            f"  - [{item['severity'].upper()}] {item['rule']} "
+            f"({item['filename']}:{item['line']}): {item['message']}"
+        )
+
+    if cache.enable_cache:
+        click.echo(click.style(f"   (Cached: {cached_count}, Fresh: {fresh_count})", fg="white"))
+
+    out_json = state.reports_dir / "gdpr_findings.json"
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(all_findings, indent=2, ensure_ascii=False), encoding="utf-8")
+    click.echo(click.style(f"\n📝 GDPR findings saved → {out_json}", fg="green", bold=True))
+
+    # Auto-remediate privacy issues if requested
+    if auto_remediate:
+        click.echo(click.style("\n🔧 Auto-remediating privacy violations...", fg="cyan", bold=True))
+        from noorlytics.remediation_engine import PrivacyRemediator
+
+        remediator = PrivacyRemediator(
+            cache_dir=Path.cwd() / ".noor" / "cache",
+            enable_cache=not no_cache  # Respect --no-cache flag
+        )
+        remediate_results = remediator.auto_remediate_privacy_findings(
+            all_findings,
+            path if path.is_dir() else path.parent,
+            interactive=interactive,
+        )
+
+        # Display remediation results
+        succeeded = sum(1 for r in remediate_results if r.status.value == "success")
+        failed = sum(1 for r in remediate_results if r.status.value == "failed")
+        skipped = sum(1 for r in remediate_results if r.status.value == "skipped")
+
+        click.echo(click.style(f"\n✅ Privacy Remediation Results:", fg="green", bold=True))
+        click.echo(f"  ✓ Succeeded: {succeeded}")
+        click.echo(f"  ⚠️  Failed:    {failed}")
+        click.echo(f"  ⊘ Skipped:   {skipped}")
+
+        # Save remediation results
+        remediate_json = state.reports_dir / "gdpr_remediation_results.json"
+        remediate_json.write_text(
+            json.dumps([r.to_dict() for r in remediate_results], indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        click.echo(click.style(f"📝 Remediation results saved → {remediate_json}", fg="green", bold=True))
+
+        if failed > 0:
+            failed_results = [r for r in remediate_results if r.status.value == "failed"]
+            _display_failed_remediations(failed_results, "Failed Privacy Remediations")
+
+
+
+@cli.command("audit-security")
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory to scan for security issues")
+@click.option("--check", "-c", type=click.Choice(["encryption", "audit_logging", "authentication", "secrets", "error_handling", "all"]), 
+              default="all", help="Which security checks to run (default: all)")
+@click.option("--remediate", "-r", is_flag=True, help="Generate AI-powered remediation suggestions using LLM")
+@click.option("--auto-fix", "-f", is_flag=True, help="Auto-apply security fixes directly to source files (requires --remediate)")
+@click.option("--interactive", "-i", is_flag=True, help="Prompt before applying each auto-fix")
+@click.option("--undo", "-u", is_flag=True, help="Restore previous security fix changes from backup")
+@click.pass_obj
+def audit_security_cmd(state: CLIState, path: Path, check: str, remediate: bool, auto_fix: bool, interactive: bool, undo: bool):
+    """Audit code for security hardening: encryption, logging, authentication, secrets handling.
+    
+    PURPOSE:
+    Scans code for security best practices including:
+    - Encryption at-rest (hardcoded credentials, plaintext storage)
+    - Encryption in-transit (HTTP vs HTTPS usage)
+    - Audit logging for sensitive operations
+    - Authentication patterns (weak passwords, hardcoded creds)
+    - Secrets/credentials management
+    - Error handling for security operations
+    
+    PARAMETERS:
+    - path (required): File or directory to scan
+      * Single file: scans that file
+      * Directory: recursively scans all supported files
+    - --check / -c: Specific security check to run
+      * encryption: hardcoded creds, plaintext storage, HTTP usage
+      * audit_logging: missing logs for sensitive operations
+      * authentication: weak auth patterns, hardcoded usernames
+      * secrets: credentials in logs/urls/config
+      * error_handling: missing try-except around security ops
+      * all: run all checks (default)
+    - --remediate / -r: Generate LLM-powered remediation suggestions (requires Ollama/OpenAI)
+    - --auto-fix / -f: Automatically apply security fixes directly to source files
+      * Requires --remediate flag
+      * Use --interactive to prompt before each fix
+      * Creates backups before modifications
+    - --interactive / -i: Prompt before applying each auto-fix
+    
+    OUTPUTS:
+    - JSON findings file: reports/audit_security_findings.json
+    - Shows security issues with line numbers and severity
+    - Provides remediation suggestions
+    - With --remediate: detailed LLM-generated remediation plans
+    - With --auto-fix: applies fixes automatically and creates backups
+    
+    EXAMPLES:
+    - noor audit-security examples/legacyfile.py              # All checks
+    - noor audit-security src/ --check encryption             # Encryption only
+    - noor audit-security . -c secrets                        # Secrets only
+    - noor audit-security . --remediate                       # With AI suggestions
+    - noor audit-security . --remediate --auto-fix            # Auto-apply fixes
+    - noor audit-security . --auto-fix --interactive          # Prompt before each fix
+    - noor audit-security . --undo                            # Restore from backup
+    """
+    # Handle --undo flag
+    if undo:
+        _undo_remediation(path)
+        return
+
+    from noorlytics.audit_security import scan_audit_security
+    
+    files = (
+        list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
+        if path.is_dir()
+        else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
+    )
+
+    if not files:
+        click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
+        raise SystemExit(2)
+
+    # Determine which checks to run
+    checks_to_run = None if check == "all" else [check]
+
+    all_findings = []
+    for fpath, content in files:
+        for item in scan_audit_security(content, str(fpath), checks=checks_to_run):
+            all_findings.append(item)
+
+    if not all_findings:
+        click.echo(click.style("✅ No security issues detected.", fg="green"))
+        return
+
+    click.echo(click.style("\n⚠️  Security audit findings detected:", fg="red", bold=True))
+    by_check = {}
+    for item in all_findings:
+        check_type = item["check_type"]
+        if check_type not in by_check:
+            by_check[check_type] = []
+        by_check[check_type].append(item)
+
+    for check_type in sorted(by_check.keys()):
+        items = by_check[check_type]
+        click.echo(click.style(f"\n  {check_type.upper()} ({len(items)} issues):", fg="yellow"))
+        # Group by filename for better readability
+        by_file = {}
+        for item in items:
+            fname = item['filename']
+            if fname not in by_file:
+                by_file[fname] = []
+            by_file[fname].append(item)
+        
+        for fname in sorted(by_file.keys()):
+            file_items = by_file[fname]
+            click.echo(click.style(f"    📄 {fname}", fg="cyan"))
+            for item in file_items:
+                click.echo(
+                    f"      - [{item['severity'].upper()}] "
+                    f"(line {item['line']}): {item['message']}"
+                )
+
+    state.reports_dir.mkdir(parents=True, exist_ok=True)
+    out_json = state.reports_dir / "audit_security_findings.json"
+    out_json.write_text(json.dumps(all_findings, indent=2, ensure_ascii=False), encoding="utf-8")
+    click.echo(click.style(f"\n📝 Security findings saved → {out_json}", fg="green", bold=True))
+
+    # Generate LLM-powered remediation if requested
+    if remediate:
+        click.echo(click.style("\n🤖 Generating AI-powered remediation suggestions...", fg="cyan", bold=True))
+        client = state.ensure_client()
+        
+        remediation_results = []
+        for finding in all_findings[:5]:  # Limit to first 5 for performance
+            prompt = f"""
+            A security issue was detected:
+            
+            Type: {finding['check_type'].upper()}
+            Severity: {finding['severity'].upper()}
+            Issue: {finding['message']}
+            Location: {finding['filename']}:{finding['line']}
+            Code: {finding['evidence']}
+            
+            Provide a detailed, actionable remediation plan with code examples.
+            Focus on best practices for secure coding.
+            Keep response concise but comprehensive.
+            """
+            
+            try:
+                response = client.generate(prompt)
+                remediation_results.append({
+                    "finding_type": finding['check_type'],
+                    "severity": finding['severity'],
+                    "issue": finding['message'],
+                    "ai_remediation": response,
+                })
+                click.echo(click.style(f"  ✓ {finding['check_type'].upper()} - {finding['message'][:50]}...", fg="green"))
+            except Exception as e:
+                if state.verbose:
+                    click.echo(click.style(f"  ✗ Error generating remediation: {e}", fg="red"))
+
+        if remediation_results:
+            remediation_json = state.reports_dir / "audit_security_remediation_ai.json"
+            remediation_json.write_text(json.dumps(remediation_results, indent=2, ensure_ascii=False), encoding="utf-8")
+            click.echo(click.style(f"✓ AI-powered remediation saved → {remediation_json}", fg="green", bold=True))
+
+    # Auto-fix security issues if requested
+    if auto_fix:
+        click.echo(click.style("\n🔧 Auto-applying security fixes...", fg="cyan", bold=True))
+        from noorlytics.remediation_engine import SecurityRemediator
+
+        remediator = SecurityRemediator(
+            cache_dir=Path.cwd() / ".noor" / "cache",
+            enable_cache=False  # Disable caching for remediation results
+        )
+        auto_fix_results = remediator.remediate_findings(
+            all_findings,
+            path if path.is_dir() else path.parent,
+            interactive=interactive,
+            validate_changes=False,  # Temporarily disabled for testing
+        )
+
+        # Display auto-fix results
+        succeeded = sum(1 for r in auto_fix_results if r.status.value == "success")
+        failed = sum(1 for r in auto_fix_results if r.status.value == "failed")
+        skipped = sum(1 for r in auto_fix_results if r.status.value == "skipped")
+
+        click.echo(click.style(f"\n✅ Auto-fix Results:", fg="green", bold=True))
+        click.echo(f"  ✓ Succeeded: {succeeded}")
+        click.echo(f"  ⚠️  Failed:    {failed}")
+        click.echo(f"  ⊘ Skipped:   {skipped}")
+
+        # Save auto-fix results
+        autofix_json = state.reports_dir / "audit_security_autofix_results.json"
+        autofix_json.write_text(
+            json.dumps([r.to_dict() for r in auto_fix_results], indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        click.echo(click.style(f"📝 Auto-fix results saved → {autofix_json}", fg="green", bold=True))
+
+        if failed > 0:
+            failed_results = [r for r in auto_fix_results if r.status.value == "failed"]
+            _display_failed_remediations(failed_results, "Failed Security Fixes")
+
+
+
+@cli.command("scan-standards")
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path), help="File or directory to scan for compliance")
+@click.option("--standard", "-s", type=click.Choice(["hipaa", "pci-dss", "soc2", "iso27001", "fedramp", "all"]), 
+              default="all", help="Which compliance standard to check (default: all)")
+@click.option("--remediate", "-r", is_flag=True, help="Generate AI-powered remediation suggestions using LLM")
+@click.option("--no-cache", is_flag=True, help="Disable caching, force fresh scan")
+@click.pass_obj
+def scan_standards_cmd(state: CLIState, path: Path, standard: str, remediate: bool, no_cache: bool):
+    """Scan code for compliance with industry standards: HIPAA, PCI-DSS, SOC 2, ISO 27001, FedRAMP.
+    
+    PURPOSE:
+    Detects compliance violations for regulated industries and standards:
+    - HIPAA: Healthcare data (PHI) protection, encryption, access controls, audit logging
+    - PCI-DSS: Payment card data protection, tokenization, network security
+    - SOC 2: Service organization controls (availability, integrity, confidentiality)
+    - ISO 27001: Information security management, asset management, access control, cryptography
+    - FedRAMP: Federal cloud authorization, data classification, FIPS 140-2 encryption, MFA
+    
+    PARAMETERS:
+    - path (required): File or directory to scan
+      * Single file: scans that file
+      * Directory: recursively scans all supported files
+    - --standard / -s: Specific compliance standard to check
+      * hipaa: Healthcare Protected Health Information rules
+      * pci-dss: Payment Card Industry Data Security Standard
+      * soc2: Service Organization Controls
+      * iso27001: Information Security Management System
+      * fedramp: Federal Risk and Authorization Management Program
+      * all: check all standards (default)
+    - --remediate / -r: Generate LLM-powered remediation suggestions (requires Ollama/OpenAI)
+      * Caches LLM responses by default for repeated runs
+    - --no-cache: Disable result caching, force fresh scan and LLM calls
+    
+    CACHING:
+    - Findings cached by file hash (.noor/cache/findings.db)
+    - LLM remediation suggestions cached per finding
+    - Cache automatically invalidated when files change
+    - Default: caching enabled (use --no-cache to disable)
+    
+    OUTPUTS:
+    - JSON findings file: reports/compliance_findings.json
+    - Shows compliance violations with requirement IDs
+    - Provides remediation guidance per standard
+    - With --remediate: detailed LLM-generated remediation plans
+    
+    EXAMPLES:
+    - noor scan-standards examples/payment.py           # All standards (cached)
+    - noor scan-standards src/ --standard hipaa         # HIPAA only
+    - noor scan-standards . -s iso27001                 # ISO 27001 only
+    - noor scan-standards . -s fedramp --remediate      # FedRAMP + AI suggestions (cached)
+    - noor scan-standards . --remediate --no-cache      # Fresh scan + LLM calls
+    """
+    from noorlytics.scan_standards import scan_standards
+    from noorlytics.cache_manager import FindingsCache
+    
+    # Initialize cache
+    cache = FindingsCache(enable_cache=not no_cache)
+    
+    files = (
+        list(_iter_code_files(path, state.allowed_ext, state.max_file_bytes))
+        if path.is_dir()
+        else list(_single_file(path, state.allowed_ext, state.max_file_bytes))
+    )
+
+    if not files:
+        click.echo(click.style("⚠️  No matching files found.", fg="yellow"))
+        raise SystemExit(2)
+
+    # Determine which standards to check
+    standards_to_check = None if standard == "all" else [standard]
+
+    all_findings = []
+    cached_count = 0
+    fresh_count = 0
+    
+    for fpath, content in files:
+        analysis_type = f"scan-standards-{standard}"
+        
+        # Check cache first
+        cached_findings = cache.get_findings(fpath, analysis_type) if cache.enable_cache else None
+        
+        if cached_findings:
+            # Use cached findings
+            for item in cached_findings:
+                all_findings.append(item)
+            cached_count += 1
+            if state.verbose:
+                click.echo(click.style(f"  📦 {fpath} (cached)", fg="cyan"))
+        else:
+            # Fresh scan
+            findings_for_file = []
+            for item in scan_standards(content, str(fpath), standards=standards_to_check):
+                findings_for_file.append(item)
+                all_findings.append(item)
+            
+            # Cache findings
+            if findings_for_file and cache.enable_cache:
+                cache.save_findings(fpath, analysis_type, findings_for_file, execution_time_ms=0)
+            
+            fresh_count += 1
+            if state.verbose:
+                click.echo(click.style(f"  🔍 {fpath} (scanned)", fg="cyan"))
+
+    if not all_findings:
+        click.echo(click.style("✅ No compliance violations detected.", fg="green"))
+        if cache.enable_cache:
+            click.echo(click.style(f"   (Cached: {cached_count}, Fresh: {fresh_count})", fg="white"))
+        return
+
+    click.echo(click.style("\n⚠️  Compliance findings detected:", fg="red", bold=True))
+    if cache.enable_cache:
+        click.echo(click.style(f"(Cached: {cached_count}, Fresh: {fresh_count})", fg="white"))
+    
+    by_standard = {}
+    for item in all_findings:
+        std = item["standard"]
+        if std not in by_standard:
+            by_standard[std] = []
+        by_standard[std].append(item)
+
+    for std in sorted(by_standard.keys()):
+        items = by_standard[std]
+        click.echo(click.style(f"\n  {std.upper()} ({len(items)} issues):", fg="yellow"))
+        # Group by filename for better readability
+        by_file = {}
+        for item in items:
+            fname = item.get('filename', 'unknown')
+            if fname not in by_file:
+                by_file[fname] = []
+            by_file[fname].append(item)
+        
+        for fname in sorted(by_file.keys()):
+            file_items = by_file[fname]
+            click.echo(click.style(f"    📄 {fname}", fg="cyan"))
+            for item in file_items:
+                line_info = f":{item['line']}" if item.get('line') else ""
+                click.echo(
+                    f"      - [{item['severity'].upper()}] Req {item['requirement']}: {item['message']}{line_info}"
+                )
+                click.echo(f"        → {item['remediation']}")
+
+    # Save findings
+    state.reports_dir.mkdir(parents=True, exist_ok=True)
+    out_json = state.reports_dir / "compliance_findings.json"
+    out_json.write_text(json.dumps(all_findings, indent=2, ensure_ascii=False), encoding="utf-8")
+    click.echo(click.style(f"\n📝 Compliance findings saved → {out_json}", fg="green", bold=True))
+
+    # Generate LLM-powered remediation if requested
+    if remediate:
+        click.echo(click.style("\n🤖 Generating AI-powered remediation suggestions...", fg="cyan", bold=True))
+        client = state.ensure_client()
+        
+        remediation_results = []
+        llm_cached_count = 0
+        llm_fresh_count = 0
+        
+        for finding in all_findings[:5]:  # Limit to first 5 for performance
+            finding_id = f"{finding['standard']}-{finding['requirement']}"
+            
+            # Check if LLM response is cached
+            cached_response = cache.get_llm_response(finding_id) if cache.enable_cache else None
+            
+            if cached_response:
+                remediation_results.append({
+                    "finding_id": finding_id,
+                    "issue": finding['message'],
+                    "ai_remediation": cached_response,
+                })
+                llm_cached_count += 1
+                click.echo(click.style(f"  ✓ {finding['standard'].upper()} {finding['requirement']} (cached)", fg="cyan"))
+            else:
+                # Call LLM
+                prompt = f"""
+            A compliance violation was detected:
+            
+            Standard: {finding['standard'].upper()}
+            Requirement: {finding['requirement']}
+            Issue: {finding['message']}
+            Code: {finding['evidence']}
+            
+            Provide a detailed, actionable remediation plan with code examples where applicable.
+            Keep response concise but comprehensive.
+            """
+                
+                try:
+                    response = client.generate(prompt)
+                    remediation_results.append({
+                        "finding_id": finding_id,
+                        "issue": finding['message'],
+                        "ai_remediation": response,
+                    })
+                    # Cache the LLM response
+                    if cache.enable_cache:
+                        cache.save_llm_response(finding_id, response)
+                    llm_fresh_count += 1
+                    click.echo(click.style(f"  ✓ {finding['standard'].upper()} {finding['requirement']}", fg="green"))
+                except Exception as e:
+                    if state.verbose:
+                        click.echo(click.style(f"  ✗ Error generating remediation: {e}", fg="red"))
+
+        if remediation_results:
+            remediation_json = state.reports_dir / "compliance_remediation_ai.json"
+            remediation_json.write_text(json.dumps(remediation_results, indent=2, ensure_ascii=False), encoding="utf-8")
+            if cache.enable_cache:
+                click.echo(click.style(f"✓ AI-powered remediation saved → {remediation_json}", fg="green", bold=True))
+                click.echo(click.style(f"   (LLM cached: {llm_cached_count}, Fresh: {llm_fresh_count})", fg="white"))
+            else:
+                click.echo(click.style(f"✓ AI-powered remediation saved → {remediation_json}", fg="green", bold=True))
+
+
+@cli.command("unified-scan")
+@click.argument("path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "-o", required=False, type=click.Path(path_type=Path), default=None, help="Output JSON file for unified findings")
+@click.option("--json-only", is_flag=True, help="Only output JSON, no progress/summary display")
+@click.pass_obj
+def unified_scan_cmd(state: CLIState, path: Path, output: Optional[Path], json_only: bool):
+    """Combine security and compliance findings into unified report.
+    
+    PURPOSE:
+    Merges audit-security (security violations) with scan-standards (compliance issues)
+    to create a unified view where overlapping issues are correlated and deduplicated.
+    
+    KEY FEATURES:
+    - Merge: Combines findings from both security and compliance scanners
+    - Deduplicate: Removes duplicate issues detected by multiple scanners
+    - Correlate: Links related findings across scanners (e.g., HTTP → HIPAA violation)
+    - Categorize: Labels findings as security-only, compliance-only, or both
+    - Severity: Calculates unified severity when issue affects both aspects
+    
+    WORKFLOW:
+    1. Scan file(s) with audit-security
+    2. Scan file(s) with scan-standards
+    3. Merge and correlate findings
+    4. Save unified report with correlation metadata
+    
+    OUTPUT:
+    Unified findings JSON with:
+    - Individual findings with merged context
+    - Correlation links showing related issues
+    - Category (security_only, compliance_only, or both)
+    - Remediation guidance combining both perspectives
+    
+    EXAMPLES:
+    - noor unified-scan file.py                              # Scan single file
+    - noor unified-scan . --json-only                        # Scan directory, JSON output
+    - noor unified-scan file.py -o report.json               # Save to specific file
+    """
+    try:
+        # state is now passed via @click.pass_obj
+        
+        # Determine files to scan
+        if path.is_file():
+            files_to_scan = [path]
+        else:
+            files_to_scan = list(path.rglob("*.py"))
+        
+        if not files_to_scan:
+            click.echo(click.style("✗ No Python files found", fg="red"))
+            return
+        
+        scanner = UnifiedScanner()
+        results = []
+        
+        if not json_only:
+            click.echo(click.style("\n🔗 Running Unified Security & Compliance Scan...\n", fg="cyan", bold=True))
+        
+        with click.progressbar(files_to_scan, label="Scanning files", show_pos=True) as bar:
+            for file_path in bar:
+                try:
+                    # Skip vendor, test, and config files
+                    if any(
+                        skip in file_path.parts
+                        for skip in {"__pycache__", ".venv", "venv", "node_modules", ".git", "tests", "test"}
+                    ):
+                        continue
+                    
+                    content = file_path.read_text(encoding="utf-8", errors="ignore")
+                    
+                    # Get security findings (content first, then filename)
+                    security_findings = scan_audit_security(content, str(file_path))
+                    
+                    # Get compliance findings (also expects content first)
+                    compliance_findings = scan_standards(content, str(file_path))
+                    
+                    # Merge and correlate
+                    result = scanner.scan(
+                        str(file_path),
+                        security_findings,
+                        compliance_findings,
+                    )
+                    
+                    if result.findings:
+                        results.append(result)
+                
+                except Exception as e:
+                    if not json_only:
+                        click.echo(click.style(f"  ✗ Error scanning {file_path}: {e}", fg="yellow"))
+        
+        # Merge all results
+        merged_summary = scanner.merge_results(results)
+        
+        # Prepare output
+        output_data = {
+            "summary": merged_summary,
+            "by_file": [r.to_dict() for r in results],
+        }
+        
+        # Determine output file
+        if output is None:
+            output = state.reports_dir / "unified_scan_findings.json"
+        
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(output_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        
+        if not json_only:
+            # Display summary
+            click.echo(click.style("\n✓ Unified Scan Complete\n", fg="green", bold=True))
+            click.echo(f"📁 Files scanned: {merged_summary['files_scanned']}")
+            click.echo(f"⚠️  Files with issues: {merged_summary['files_with_issues']}")
+            click.echo(f"📊 Total findings: {merged_summary['total_findings']}")
+            
+            # Severity breakdown
+            click.echo("\nBy Severity:")
+            click.echo(f"  🔴 High: {merged_summary['by_severity']['high']}")
+            click.echo(f"  🟠 Medium: {merged_summary['by_severity']['medium']}")
+            click.echo(f"  🟡 Low: {merged_summary['by_severity']['low']}")
+            
+            # Category breakdown
+            click.echo("\nBy Category:")
+            click.echo(f"  🔒 Security-only: {merged_summary['by_category']['security_only']}")
+            click.echo(f"  📋 Compliance-only: {merged_summary['by_category']['compliance_only']}")
+            click.echo(f"  ⚠️  Both (overlapping): {merged_summary['by_category']['both']}")
+            
+            # Show sample correlations
+            if any(r.correlations for r in results):
+                click.echo("\n🔗 Correlation Examples:")
+                correlation_count = 0
+                for result in results:
+                    for finding_id, correlated_ids in result.correlations.items():
+                        if correlation_count < 3:
+                            finding = result.findings.get(finding_id)
+                            if finding:
+                                click.echo(f"  • {finding.title}")
+                                for corr_id in correlated_ids[:1]:
+                                    corr_finding = result.findings.get(corr_id)
+                                    if corr_finding:
+                                        click.echo(f"    ↔️  {corr_finding.title}")
+                                correlation_count += 1
+            
+            click.echo(click.style(f"\n✓ Findings saved → {output}\n", fg="green", bold=True))
+        else:
+            # Just output JSON
+            click.echo(json.dumps(output_data, indent=2, ensure_ascii=False))
+    
+    except Exception as e:
+        click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)
+        raise click.ClickException(str(e))
+
+
+@cli.command("assess")
+@click.argument("manifest_or_findings", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--context", "-c", required=False, type=click.Path(exists=True, path_type=Path), default=None, help="Customer context JSON file (default: noorlytics/templates/customer_context_default.json)")
+@click.option("--llm-model", type=str, help="LLM model (ollama:mistral|openai:gpt-4)")
+@click.option("--save-history", is_flag=True, help="Save assessment to history tracking")
+@click.option("--compare-versions", is_flag=True, help="Compare with previous assessment version")
+@click.option("--export-format", type=click.Choice(["json", "csv", "markdown"]), help="Auto-export decision format")
+@click.option("--export-output", type=click.Path(), help="Where to save export file")
+@click.option("--metrics-report", is_flag=True, help="Generate metrics dashboard after assessment")
+@click.option("--create-report", type=click.Path(), help="Generate markdown report with decisions + metrics")
+@click.pass_obj
+def assess_cmd(
+    state: CLIState,
+    manifest_or_findings: Path,
+    context: Path,
+    llm_model: str,
+    save_history: bool,
+    compare_versions: bool,
+    export_format: str,
+    export_output: str,
+    metrics_report: bool,
+    create_report: str,
+):
+    """Convert technical findings into prioritized business decisions.
+    
+    PURPOSE:
+    Transforms technical issues into business-critical decisions by:
+    - Assessing impact using customer context
+    - Ranking by priority (P1=Critical, P4=Enhancement)
+    - Generating rationale and recommendations
+    - Optionally storing for trend analysis
+    
+    WORKFLOW:
+    1. Provide manifest or findings: noor assess requirements.txt
+    2. (Optional) Use custom context: --context my_context.json
+    3. (Optional) Save for tracking: --save-history
+    4. (Optional) Generate reports: --create-report decision_report.md
+    
+    PARAMETERS:
+    - manifest_or_findings (required): 
+      * requirements.txt, package.json, pyproject.toml (manifests)
+      * requirements.txt.findings.json (pre-analyzed findings)
+    - --context: Custom decision context JSON
+      * Default: built-in template with standard risk weights
+      * Customize: security, cost_control, delivery_speed, maintainability
+    - --llm-model: Enhance with AI rationales (e.g., ollama:mistral)
+    - --save-history: Store in database for change tracking
+    - --compare-versions: Show what changed since last assessment
+    - --export-format: Export decisions (json/csv/markdown)
+    - --export-output: Save exports to file
+    - --metrics-report: Generate metrics dashboard
+    - --create-report: Save combined report with metrics
+    
+    OUTPUTS:
+    - Displays decisions grouped by priority (P1-P4)
+    - Saves assessment JSON and Markdown
+    - (Optional) Stores in database: noorlytics/decisions.db
+    - (Optional) Generates metrics and comparison reports
+    
+    EXAMPLES:
+    - noor assess requirements.txt                            # Basic assessment
+    - noor assess requirements.txt --save-history            # With database tracking
+    - noor assess requirements.txt --context custom.json      # Custom priorities
+    - noor assess requirements.txt --create-report report.md  # Full report
+    """
+    try:
+        # Use default template if no context specified
+        if context is None:
+            if not DEFAULT_TEMPLATE_PATH.exists():
+                click.echo(
+                    click.style(
+                        f"❌ Default template not found: {DEFAULT_TEMPLATE_PATH}",
+                        fg="red",
+                        bold=True,
+                    )
+                )
+                raise click.ClickException(
+                    f"Default template missing. Please provide a template via --context or install the default at {DEFAULT_TEMPLATE_PATH}"
+                )
+            context = DEFAULT_TEMPLATE_PATH
+            click.echo(
+                click.style(
+                    f"ℹ️  Using default template: {DEFAULT_TEMPLATE_PATH}",
+                    fg="cyan",
+                    bold=True,
+                )
+            )
+        
+        # Load customer context
+        customer_context = CustomerContext.from_json_file(str(context))
+        click.echo(
+            click.style(
+                f"✓ Loaded customer context: {customer_context.customer_name}",
+                fg="cyan",
+                bold=True,
+            )
+        )
+
+        # Load or generate findings
+        if manifest_or_findings.name.endswith(".findings.json"):
+            # Load findings from JSON
+            findings = FindingsCollection.from_json_file(str(manifest_or_findings))
+            click.echo(
+                click.style(
+                    f"✓ Loaded findings: {len(findings.findings)} total",
+                    fg="cyan",
+                    bold=True,
+                )
+            )
+            findings_source = str(manifest_or_findings)
+        else:
+            # Analyze manifest and generate findings
+            analysis = analyze_dependencies_file(manifest_or_findings)
+            findings = transform_analysis_to_findings(analysis)
+            click.echo(
+                click.style(
+                    f"✓ Analyzed manifest: {len(findings.findings)} findings generated",
+                    fg="cyan",
+                    bold=True,
+                )
+            )
+            findings_source = str(manifest_or_findings)
+
+        # Display customer context
+        click.echo("")
+        click.echo(click.style("Customer Risk Profile:", fg="cyan", bold=True))
+        prefs = customer_context.risk_preferences
+        click.echo(f"  - Security: {prefs.security.upper()}")
+        click.echo(f"  - Business Continuity: {prefs.business_continuity.upper()}")
+        click.echo(f"  - Cost Control: {prefs.cost_control.upper()}")
+        click.echo(f"  - Delivery Speed: {prefs.delivery_speed.upper()}")
+
+        # Generate assessment
+        engine = AssessmentEngine(customer_context)
+        assessment = engine.assess(findings, findings_source)
+
+        # Display decision summary
+        click.echo("")
+        click.echo(click.style("Generated Decisions:", fg="cyan", bold=True))
+        by_priority = {}
+        for decision in assessment.decisions:
+            if decision.priority not in by_priority:
+                by_priority[decision.priority] = []
+            by_priority[decision.priority].append(decision)
+
+        for priority in ["P1", "P2", "P3", "P4"]:
+            decisions_at_priority = by_priority.get(priority, [])
+            if decisions_at_priority:
+                click.echo(f"  {priority}: {len(decisions_at_priority)} decision(s)")
+
+        # Save assessment results
+        state.reports_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine output filenames
+        if manifest_or_findings.name.endswith(".findings.json"):
+            base_name = manifest_or_findings.stem.replace(".findings", "")
+        else:
+            base_name = manifest_or_findings.name
+
+        # Save JSON assessment
+        out_assess_json = state.reports_dir / f"{base_name}.assess.json"
+        assessment.to_json_file(str(out_assess_json))
+        click.echo(
+            click.style(f"\n📋 Assessment JSON saved → {out_assess_json}", fg="green", bold=True)
+        )
+
+        # Save Markdown assessment
+        out_assess_md = _next_versioned_markdown_path(state.reports_dir, f"{base_name}.assess")
+        assessment_md = assessment.to_markdown()
+        _save_and_print(assessment_md, out_assess_md, header=f"{base_name} – assessment")
+
+        # ---- Phase 3 Enhancements: Decision Store, History, Analytics ----
+        
+        # Optionally enhance decisions with LLM
+        if llm_model:
+            click.echo("")
+            click.echo(click.style("🤖 Enhancing decisions with LLM...", fg="cyan", bold=True))
+            try:
+                from noorlytics.llm_decision_engine import LLMDecisionEnhancer
+                from noorlytics.llm_interface import LLMClient
+
+                backend, model = llm_model.split(":", 1)
+                llm_client = LLMClient(mode=backend, model=model)
+                enhancer = LLMDecisionEnhancer(llm_client=llm_client, model=f"{backend}:{model}")
+
+                for decision in assessment.decisions:
+                    enhanced = enhancer.enhance_decision(decision, customer_context, findings)
+                    if enhanced.rationale:
+                        decision.rationale = enhanced.rationale
+                click.echo(click.style(f"✅ Enhanced {len(assessment.decisions)} decisions with LLM", fg="green"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  LLM enhancement failed: {e}", fg="yellow"))
+        
+        # Optionally store decisions for history tracking
+        if save_history:
+            click.echo("")
+            click.echo(click.style("💾 Storing decisions to history...", fg="cyan", bold=True))
+            try:
+                from noorlytics.decision_store import DecisionStore
+                
+                store = DecisionStore()
+                manifest_path = str(manifest_or_findings)
+                for decision in assessment.decisions:
+                    store.store_decision(decision, customer_context, manifest_path, assessment_version=1)
+                
+                click.echo(click.style(f"✅ Stored {len(assessment.decisions)} decisions", fg="green"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  History storage failed: {e}", fg="yellow"))
+        
+        # Optionally compare with previous version
+        if compare_versions:
+            click.echo("")
+            click.echo(click.style("📊 Comparing with previous assessment...", fg="cyan", bold=True))
+            try:
+                from noorlytics.decision_history import DecisionHistory
+                from noorlytics.decision_store import DecisionStore
+                
+                store = DecisionStore()
+                history = DecisionHistory(store)
+                manifest_path = str(manifest_or_findings)
+                timeline = history.get_assessment_timeline(manifest_path)
+                if len(timeline) > 1:
+                    diff = history.get_assessment_diff(manifest_path, 1, 2)
+                    click.echo(click.style(f"Changes detected:", fg="blue"))
+                    click.echo(f"  Added: {len(diff.added)}")
+                    click.echo(f"  Removed: {len(diff.removed)}")
+                    click.echo(f"  Modified: {len(diff.modified)}")
+                else:
+                    click.echo(click.style("No previous assessment found", fg="yellow"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Version comparison failed: {e}", fg="yellow"))
+        
+        # Optionally export decisions in requested format
+        if export_format and export_output:
+            click.echo("")
+            click.echo(click.style(f"📤 Exporting decisions as {export_format}...", fg="cyan", bold=True))
+            try:
+                from noorlytics.decision_store import DecisionStore
+                
+                store = DecisionStore()
+                manifest_path = str(manifest_or_findings)
+                decisions = store.query_decisions(manifest_path=manifest_path)
+                
+                export_path = Path(export_output)
+                export_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                if export_format == "json":
+                    import json
+                    with open(export_path, "w") as f:
+                        json.dump([d.to_dict() for d in decisions], f, indent=2)
+                elif export_format == "csv":
+                    import csv
+                    if decisions:
+                        with open(export_path, "w", newline="") as f:
+                            writer = csv.DictWriter(f, fieldnames=decisions[0].to_dict().keys())
+                            writer.writeheader()
+                            for d in decisions:
+                                writer.writerow(d.to_dict())
+                elif export_format == "markdown":
+                    from noorlytics.decision_store import DecisionStore
+                    export_data = store.export_decisions(manifest_path, format=export_format)
+                    with open(export_path, "w") as f:
+                        f.write(export_data)
+                
+                click.echo(click.style(f"✅ Exported to {export_path}", fg="green"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Export failed: {e}", fg="yellow"))
+        
+        # Optionally generate metrics report
+        if metrics_report:
+            click.echo("")
+            click.echo(click.style("📈 Generating metrics dashboard...", fg="cyan", bold=True))
+            try:
+                from noorlytics.decision_analytics import DecisionAnalytics
+                from noorlytics.decision_store import DecisionStore
+                
+                store = DecisionStore()
+                analytics = DecisionAnalytics(store)
+                dashboard = analytics.generate_metrics_dashboard()
+                metrics_output = state.reports_dir / f"{base_name}.metrics.txt"
+                with open(metrics_output, "w") as f:
+                    f.write(dashboard)
+                click.echo(click.style(f"✅ Metrics saved to {metrics_output}", fg="green"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Metrics generation failed: {e}", fg="yellow"))
+        
+        # Optionally create combined report
+        if create_report:
+            click.echo("")
+            click.echo(click.style("📑 Creating combined report...", fg="cyan", bold=True))
+            try:
+                from noorlytics.decision_store import DecisionStore
+                from noorlytics.decision_analytics import DecisionAnalytics
+                
+                report_path = Path(create_report)
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                with open(report_path, "w") as f:
+                    f.write(f"# Assessment Report: {base_name}\n\n")
+                    f.write("## Assessment Summary\n\n")
+                    f.write(assessment_md)
+                    f.write("\n\n## Metrics Dashboard\n\n")
+                    
+                    try:
+                        store = DecisionStore()
+                        analytics = DecisionAnalytics(store)
+                        dashboard = analytics.generate_metrics_dashboard()
+                        f.write(dashboard)
+                    except Exception:
+                        f.write("(Metrics generation not available)\n")
+                
+                click.echo(click.style(f"✅ Report saved to {report_path}", fg="green"))
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Report generation failed: {e}", fg="yellow"))
+
+    except FileNotFoundError as e:
+        click.echo(click.style(f"❌ Error: File not found: {e}", fg="red", bold=True), err=True)
+    except json.JSONDecodeError as e:
+        click.echo(
+            click.style(
+                f"❌ Error: Invalid JSON in customer context: {e}", fg="red", bold=True
+            ),
+            err=True,
+        )
+    except Exception as e:
+        click.echo(
+            click.style(f"❌ Error during assessment: {e}", fg="red", bold=True), err=True
+        )
+        if state.verbose:
+            import traceback
+            traceback.print_exc()
 
 
 @cli.command("refactor")
@@ -522,20 +1990,44 @@ def analyze_deps_cmd(state: CLIState, manifest: Path):
 @click.option("--interactive", "-i", is_flag=True, help="Prompt for confirmation on each change. Short form: -i.")
 @click.option("--undo", "-u", is_flag=True, help="Restore last refactoring changes from backup. Short form: -u.")
 @click.option("--git-commit", "-gc", is_flag=True, help="Stage and commit changes to git after applying. Short form: -gc.")
+@click.option("--no-cache", is_flag=True, help="Generate a fresh LLM plan for each file and refresh its cached plan.")
 @click.pass_obj
-def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, interactive: bool, undo: bool, git_commit: bool):
-    """Create AI-assisted refactor plans for file or package.
-
-        Short flags: `-a`, `-dr`, `-i`, `-u`, `-gc`.
-
-        \b
-        Examples:
-            noor refactor file.py
-            noor refactor file.py -dr
-            noor refactor file.py -i
-            noor refactor file.py -a
-            noor refactor file.py -u
-            noor refactor file.py -i -gc
+def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, interactive: bool, undo: bool, git_commit: bool, no_cache: bool = False):
+    """Create AI-assisted refactoring plans with flexible execution modes.
+    
+    PURPOSE:
+    Generate and execute code refactoring recommendations for:
+    - Code simplification and clarity
+    - Performance improvements
+    - Pattern adoption and consistency
+    - Maintainability enhancements
+    - Technical debt reduction
+    
+    PARAMETERS:
+    - path (required): File or directory to refactor
+    - --apply (-a): Apply changes automatically (non-interactive)
+    - --dry-run (-dr): Show changes without modifying files
+    - --interactive (-i): Prompt for confirmation on each change
+    - --undo (-u): Restore previous refactoring from backup
+    - --git-commit (-gc): Auto-commit changes to git
+    
+    MODES:
+    - Planning (default): Generate refactor plan only
+    - Dry-run: Show proposed changes
+    - Interactive: Review and approve each change
+    - Auto-apply: Apply all changes without prompting
+    
+    OUTPUTS:
+    - Refactor plan with detailed changes (Markdown)
+    - Backups of modified files (if applied)
+    - Git commits (if --git-commit enabled)
+    
+    EXAMPLES:
+    - noor refactor file.py                        # Plan only
+    - noor refactor file.py --dry-run              # Show changes
+    - noor refactor file.py --interactive          # Review each change
+    - noor refactor file.py --apply                # Auto-apply all
+    - noor refactor file.py --apply --git-commit   # Apply and commit
     """
     
     # Handle --undo flag
@@ -561,57 +2053,123 @@ def refactor_cmd(state: CLIState, path: Path, apply: bool, dry_run: bool, intera
         click.echo(click.style(f"📦 Refactoring {path.name} ({mode_str} mode)...", fg="cyan"))
         click.echo(click.style(f"   Found {len(files)} files", fg="blue"))
         click.echo()
+    
+    # Issue 3: Warmup Ollama with progress feedback (only once at the start)
+    if client.mode == "ollama" and len(files) > 0:
+        click.echo(click.style("🔄 Preparing LLM model...", fg="cyan"))
+        if not client.warmup():
+            click.echo(click.style("   ⚠️  Model warmup failed (will retry on first use)", fg="yellow"))
+        else:
+            click.echo(click.style("   ✓ Model ready", fg="green"))
 
     applied_count = 0
     failed_count = 0
-
+    
+    # Issue 1: Parallel processing with ThreadPoolExecutor (4-8x speedup for multi-file dirs)
+    # Issue 2: Uses cached_refactor to skip redundant LLM calls
+    def _process_file_for_refactor(fpath: Path, content: str) -> Tuple[Path, Optional[str], Optional[str], bool]:
+        """Process a single file for refactoring.
+        
+        Returns:
+            Tuple of (fpath, markdown_plan, error_msg, success)
+        """
+        try:
+            display_path = fpath.relative_to(path if path.is_dir() else path.parent)
+            prog.console.print(f"   Processing: {display_path}", markup=False)
+            # Issue 2: Use cached_refactor to check cache first, saving 20-50s per re-run
+            md = client.cached_refactor(fpath.name, content, force_refresh=True) if no_cache else client.cached_refactor(fpath.name, content)
+            return (fpath, md, None, True)
+        except Exception as e:
+            return (fpath, None, str(e), False)
+    
+    # Determine number of parallel workers (4 is a safe default to avoid overwhelming Ollama)
+    max_workers = min(4, len(files)) if len(files) > 1 else 1
+    
     with render_progress("Generating refactor plans…") as prog:
+        prog.columns = (*prog.columns, TextColumn("{task.completed:.0f}/{task.total:.0f} files completed"))
         t = prog.add_task("run", total=len(files))
-        for fpath, content in files:
-            try:
-                # Generate plan
-                md = client.refactor(fpath.name, content)
+        
+        # Use ThreadPoolExecutor for parallel processing (Issue 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures_to_files = {
+                executor.submit(_process_file_for_refactor, fpath, content): (fpath, content)
+                for fpath, content in files
+            }
+            
+            for future in as_completed(futures_to_files):
+                fpath, original_content = futures_to_files[future]
                 
-                # Parse changes
-                parser = RefactorPlanParser(md)
-                changes = parser.parse()
-                
-                if not changes:
-                    click.echo(click.style(f"   ⚠️  {fpath.name}: No structured changes found", fg="yellow"))
-                    prog.advance(t)
-                    continue
-                
-                # Save plan markdown (sorted by priority)
-                plan_out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.refactor")
-                generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
-                plan_out.parent.mkdir(parents=True, exist_ok=True)
-                # Use regenerated markdown (sorted HIGH → MEDIUM → LOW)
-                sorted_markdown = parser.to_markdown()
-                plan_out.write_text(f"Generated: {generated_at}\n\n{sorted_markdown}", encoding="utf-8")
-                
-                # Handle different modes
-                if dry_run:
-                    _show_dry_run(fpath, changes)
-                    applied_count += 1
-                elif interactive:
-                    if _interactive_apply(fpath, changes, state.reports_dir, git_commit):
+                try:
+                    fpath_result, md, error_msg, success = future.result()
+                    
+                    if not success or md is None:
+                        click.echo(click.style(f"   ❌ {fpath.name}: {error_msg}", fg="red"))
+                        failed_count += 1
+                        continue
+                    
+                    # Parse changes
+                    parser = RefactorPlanParser(md)
+                    changes = parser.parse()
+                    
+                    # Save plan markdown (sorted by priority)
+                    plan_out = _next_versioned_markdown_path(state.reports_dir, f"{fpath.name}.refactor")
+                    generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+                    plan_out.parent.mkdir(parents=True, exist_ok=True)
+                    # Use regenerated markdown (sorted HIGH → MEDIUM → LOW)
+                    sorted_markdown = parser.to_markdown()
+                    unresolved_lines = "\n".join(line for line in md.splitlines() if line.startswith("Unresolved:"))
+                    if unresolved_lines:
+                        sorted_markdown += "\n\n" + unresolved_lines
+                    plan_out.write_text(f"Generated: {generated_at}\n\n{sorted_markdown}", encoding="utf-8")
+                    findings = collect_refactor_findings(fpath.name, original_content)
+                    coverage_out = plan_out.with_suffix(".coverage.json")
+
+                    def save_coverage():
+                        coverage = plan_coverage(findings, changes, md)
+                        coverage_out.write_text(json.dumps({
+                            "file": str(fpath), "detector_version": DETECTOR_VERSION,
+                            "findings": coverage,
+                        }, indent=2), encoding="utf-8")
+                        return coverage
+
+                    coverage = save_coverage()
+                    if findings:
+                        planned = sum(item["status"] == "planned" for item in coverage)
+                        unresolved = sum(item["status"] == "unresolved" for item in coverage)
+                        omitted = sum(item["status"] == "omitted" for item in coverage)
+                        click.echo(f"   Local findings: {len(findings)} | Planned: {planned} | Unresolved: {unresolved} | Omitted: {omitted}")
+                        for item in coverage:
+                            if item["status"] in {"omitted", "unresolved"}:
+                                click.echo(f"      {item['status'].upper()}: {item['id']} {item['scope']} ({item['rule']}) {item['reason']}")
+                        click.echo(f"   Coverage report: {coverage_out}")
+                    if not changes:
+                        click.echo(click.style(f"   ⚠️  {fpath.name}: No structured changes found; coverage saved", fg="yellow"))
+                        continue
+                    
+                    # Handle different modes
+                    if dry_run:
+                        _show_dry_run(fpath, changes)
                         applied_count += 1
-                elif apply:
-                    if _auto_apply(fpath, changes, state.reports_dir, git_commit):
-                        applied_count += 1
-                else:
-                    # Default: just show plan
-                    if not (path.is_dir() and len(files) > 1):
-                        _save_and_print(md, plan_out, header=fpath.name)
+                    elif interactive:
+                        if _interactive_apply(fpath, changes, state.reports_dir, git_commit):
+                            applied_count += 1
+                    elif apply:
+                        if _auto_apply(fpath, changes, state.reports_dir, git_commit):
+                            applied_count += 1
                     else:
-                        click.echo(click.style(f"   ✅ {fpath.name} → {plan_out.name}", fg="green"))
-                    applied_count += 1
-                
-            except Exception as e:
-                click.echo(click.style(f"   ❌ {fpath.name}: {e}", fg="red"))
-                failed_count += 1
-            finally:
-                prog.advance(t)
+                        # Default: just show plan
+                        if not (path.is_dir() and len(files) > 1):
+                            _save_and_print(md, plan_out, header=fpath.name)
+                        else:
+                            click.echo(click.style(f"   ✅ {fpath.name} → {plan_out.name}", fg="green"))
+                        applied_count += 1
+                    save_coverage()
+                    
+                except Exception as e:
+                    click.echo(click.style(f"   ❌ {fpath.name}: {e}", fg="red"))
+                    failed_count += 1
+                finally:
+                    prog.advance(t)
 
     # Summary
     if path.is_dir() and len(files) > 1:
@@ -656,6 +2214,9 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
     Returns:
         True if changes were applied, False otherwise
     """
+    for change in changes:
+        change.application_status = "skipped"
+        change.application_reason = "Not approved or could not be applied"
     # Build dependency graph
     graph = DependencyGraph(changes)
     chains = graph.group_by_chains()
@@ -664,7 +2225,7 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
     # same staged content that final application will see.
     preview = FileRewriter(fpath)
     # Applicator: collects changes to apply
-    applicator = FileRewriter(fpath)
+    applicator = preview
     
     approved_changes = []
     processed_indices = set()
@@ -686,6 +2247,11 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
             
             change = changes[idx]
             position = f"[{idx+1}/{len(changes)}]"
+            if change.is_cosmetic_only():
+                change.application_reason = "Formatting/quote-only edit or identical code; no meaningful refactor"
+                click.echo(f"   Skipping {change.display_title()}: {change.application_reason}")
+                processed_indices.add(idx)
+                continue
             
             click.echo(f"\n{position} [{change.priority.value}] {change.display_title()}")
             _render_change_code_block(change, indent="   ")
@@ -709,23 +2275,20 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
             
             # Validate against the staged preview state so sequential approvals
             # can build on earlier approved changes.
-            can_apply = False
-            dry_run_content = preview._apply_change_with_flexible_match(
-                change.before_code,
-                change.after_code,
-                preview.current_content,
-            )
-            if dry_run_content is not None and dry_run_content != preview.current_content:
-                can_apply = True
-            elif preview._find_rebased_before_code(change.before_code, change.after_code) is not None:
-                can_apply = True
-            elif preview._find_with_flexible_match(change.after_code, preview.current_content):
-                can_apply = True
+            staged_content = preview.current_content
+            staged_changes = list(preview.changes_applied)
+            staged_successful, staged_failed, staged_details = preview.apply_all_changes([change])
+            can_apply = staged_successful > 0 and staged_failed == 0
             if not can_apply:
-                if _has_real_dependency(change.depends_on):
-                    click.echo(click.style(f"   ⚠️  Code not found in current staged file state (depends on: {change.depends_on})", fg="yellow"))
-                else:
-                    click.echo(click.style("   ⚠️  Code not found in current staged file state (may conflict with earlier changes)", fg="yellow"))
+                preview.current_content = staged_content
+                preview.changes_applied = staged_changes
+                change.application_reason = staged_details.get(0, "Could not apply to the current staged file")
+                click.echo(click.style(f"   Skipping: {change.application_reason}", fg="yellow"))
+                processed_indices.add(idx)
+                for dependent_idx in graph.get_all_dependents(idx, include_self=False):
+                    changes[dependent_idx].application_reason = f"Depends on failed option: {change.display_title()}"
+                    processed_indices.add(dependent_idx)
+                continue
             
             # Show chain implications
             dependents = graph.get_all_dependents(idx, include_self=False)
@@ -737,7 +2300,6 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
             
             response = click.confirm("   Apply this change?", default=True)
             if response and can_apply:
-                newly_approved = [change]
                 # Add this change and all its dependents
                 approved_changes.append(change)
                 processed_indices.add(idx)
@@ -746,12 +2308,21 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
                 for dep_idx in dependents:
                     if dep_idx not in processed_indices:
                         dep_change = changes[dep_idx]
-                        approved_changes.append(dep_change)
-                        newly_approved.append(dep_change)
+                        dependent_content = preview.current_content
+                        dependent_changes = list(preview.changes_applied)
+                        dep_successful, dep_failed, dep_details = preview.apply_all_changes([dep_change])
                         processed_indices.add(dep_idx)
-                        click.echo(click.style(f"   ⛓️  Auto-including dependent: {dep_change.display_title()}", fg="cyan"))
-
-                preview.apply_all_changes(newly_approved)
+                        if dep_failed or not dep_successful:
+                            preview.current_content = dependent_content
+                            preview.changes_applied = dependent_changes
+                            dep_change.application_reason = dep_details.get(0, "Could not stage dependent change")
+                            click.echo(click.style(f"   Skipping dependent {dep_change.display_title()}: {dep_change.application_reason}", fg="yellow"))
+                            for downstream_idx in graph.get_all_dependents(dep_idx, include_self=False):
+                                changes[downstream_idx].application_reason = f"Depends on failed option: {dep_change.display_title()}"
+                                processed_indices.add(downstream_idx)
+                        else:
+                            approved_changes.append(dep_change)
+                            click.echo(click.style(f"   ⛓️  Auto-including validated dependent: {dep_change.display_title()}", fg="cyan"))
                 
                 chain_approved = True
                 click.echo(click.style("   ✅ Approved (including dependents)", fg="green"))
@@ -759,31 +2330,29 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
                 click.echo(click.style("   ⏭️  Skipping (code not found)", fg="yellow"))
                 processed_indices.add(idx)
             else:
+                preview.current_content = staged_content
+                preview.changes_applied = staged_changes
                 processed_indices.add(idx)
     
     if approved_changes:
         click.echo()
         if click.confirm(f"Write {len(approved_changes)} changes to {fpath.name}?", default=True):
             try:
-                # Apply all approved changes atomically for the chosen set.
-                successful, failed, failure_details = applicator.apply_all_changes(approved_changes)
-
-                if failed > 0:
-                    applicator.rollback()
-                    click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied; rolling back the entire selection.", fg="yellow"))
-                    for idx, change in enumerate(approved_changes):
-                        if idx in failure_details:
-                            reason = failure_details.get(idx, "Code not found in file")
-                            click.echo(f"      ❌ {change.display_title()}")
-                            _render_change_code_block(change)
-                            click.echo(f"         Reason: {reason}")
-                    click.echo(click.style("   No file changes were written because the refactor set was not fully successful.", fg="yellow"))
+                if fpath.read_text(encoding="utf-8", errors="replace") != applicator.original_content:
+                    click.echo(click.style("   Source changed during review; no changes written. Run refactor again.", fg="yellow"))
                     return False
+                successful = len(approved_changes)
 
                 if successful > 0:
                     applicator.write()
                     _save_diff_report(fpath, applicator, reports_dir)
-                    click.echo(click.style(f"✨ Applied {successful}/{len(approved_changes)} changes to {fpath.name}", fg="green"))
+                    for change in approved_changes:
+                        change.application_status = "applied"
+                        change.application_reason = ""
+                    click.echo(click.style(f"✨ Applied {successful}/{len(changes)} suggestions to {fpath.name}", fg="green"))
+                    skipped_count = len(changes) - len(approved_changes)
+                    if skipped_count:
+                        click.echo(click.style(f"   {skipped_count} suggestion(s) skipped or declined; not all suggestions were applied.", fg="yellow"))
 
                     # Handle git integration if requested
                     if git_commit and GitIntegration.is_git_repo(fpath):
@@ -813,11 +2382,12 @@ def _interactive_apply(fpath: Path, changes: List, reports_dir: Path, git_commit
 
 
 def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool = False) -> bool:
-    """Automatically apply all complete refactoring changes with dependency grouping.
+    """Apply compatible complete changes, preferring the first conflicting option.
 
-    The apply-all path intentionally applies every complete refactor block in the
-    plan, regardless of priority, while still skipping incomplete/truncated code
-    snippets that are not safe to patch automatically.
+    Process suggestions in plan order regardless of priority. Skip incomplete
+    snippets, later conflicting alternatives, and dependents of those alternatives.
+    Failed steps are restored individually and their dependents are skipped.
+    Successful staged changes are written together with an original-file backup.
 
     Args:
         fpath: Path to file to refactor
@@ -828,6 +2398,9 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
     Returns:
         True if changes were applied, False otherwise
     """
+    for change in changes:
+        change.application_status = "skipped"
+        change.application_reason = "Code snippet is incomplete or could not be applied"
     # Build dependency graph
     graph = DependencyGraph(changes)
 
@@ -837,12 +2410,20 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
         click.echo(click.style(f"   ℹ️  No refactors found for {fpath.name}", fg="blue"))
         return False
 
-    complete_changes = [c for c in changes if c.is_complete()]
-    incomplete_changes = [c for c in changes if not c.is_complete()]
+    applicable_placeholder_indices = {
+        idx for idx, change in enumerate(changes)
+        if not change.is_complete()
+        and rewriter._apply_placeholder_renames_within_block(
+            change.before_code, change.after_code, rewriter.current_content
+        ) is not None
+    }
+    complete_changes = [c for idx, c in enumerate(changes) if c.is_complete() or idx in applicable_placeholder_indices]
+    incomplete_changes = [c for idx, c in enumerate(changes) if not c.is_complete() and idx not in applicable_placeholder_indices]
 
     # Print header with change summary
     click.echo(click.style(f"\n   📋 Refactoring Plan for {fpath.name}:", fg="cyan"))
-    click.echo(click.style(f"      Total suggestions: {len(changes)} | Complete: {len(complete_changes)} | Incomplete: {len(incomplete_changes)}", fg="blue"))
+    click.echo(click.style(f"      Total suggestions: {len(changes)} | Complete snippets: {len(complete_changes)} | Incomplete: {len(incomplete_changes)}", fg="blue"))
+    click.echo("      Snippet completeness does not mean the changes match the current file.")
     click.echo()
 
     if not complete_changes:
@@ -858,31 +2439,63 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
         if complete_chain:
             complete_chains.append(complete_chain)
 
-    # Reject incompatible refactors that edit the same original symbol without an
-    # explicit dependency chain. This is the root cause behind corrupted output
-    # like main -> main(args) and main -> run being auto-applied together.
-    conflict_pairs = _find_conflicting_symbol_changes(complete_changes)
-    if conflict_pairs:
-        click.echo(click.style("\n   ⚠️  Incompatible auto-apply detected:", fg="yellow"))
-        for i, j, symbol in conflict_pairs:
-            left = complete_changes[i]
-            right = complete_changes[j]
-            click.echo(
-                f"      {left.display_title()} and {right.display_title()} both modify `{symbol}` "
-                "without a valid dependency chain"
-            )
-            _render_change_code_block(left, indent="      ")
-            _render_change_code_block(right, indent="      ")
-        click.echo(click.style("   Skipping auto-apply for this refactor set to avoid corrupting the file.", fg="yellow"))
-        return False
+    selected_changes = []
+    skipped_reasons = {}
+    for idx, change in enumerate(changes):
+        if idx in skipped_reasons:
+            continue
+        if change.is_cosmetic_only():
+            skipped_reasons[idx] = "Formatting/quote-only edit or identical code; no meaningful refactor"
+            continue
+        if not change.is_complete() and idx not in applicable_placeholder_indices:
+            skipped_reasons[idx] = "Code snippet is truncated/incomplete"
+            for dependent_idx in graph.get_all_dependents(idx, include_self=False):
+                skipped_reasons[dependent_idx] = f"Depends on incomplete option: {change.display_title()}"
+            continue
+        conflicts = _find_conflicting_symbol_changes(selected_changes + [change])
+        if conflicts:
+            first_idx, _, symbol = conflicts[0]
+            first = selected_changes[first_idx]
+            skipped_reasons[idx] = f"Conflicts on `{symbol}`; keeping the first option: {first.display_title()}"
+            for dependent_idx in graph.get_all_dependents(idx, include_self=False):
+                skipped_reasons[dependent_idx] = f"Depends on skipped option: {change.display_title()}"
+            continue
+        staged_content = rewriter.current_content
+        staged_changes = list(rewriter.changes_applied)
+        successful_step, failed_step, step_details = rewriter.apply_all_changes([change])
+        if not failed_step and fpath.suffix == ".py":
+            import ast
 
-    # Apply changes in their original plan order. Group-flattening can reorder
-    # independent steps after later dependency chains, which breaks stale-snippet
-    # rebasing when a later change expects an earlier rename from the same block.
-    ordered_complete_changes = complete_changes
+            def subscript_keys(code):
+                tree = ast.parse(rewriter._remove_indentation(code))
+                return {
+                    node.slice.value
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Subscript)
+                    and isinstance(node.slice, ast.Constant)
+                    and isinstance(node.slice.value, str)
+                }
 
-    # Try to apply all complete changes in chain order.
-    successful, failed, failure_details = rewriter.apply_all_changes(ordered_complete_changes)
+            try:
+                removed_keys = subscript_keys(change.before_code) - subscript_keys(change.after_code)
+                remaining_keys = removed_keys & subscript_keys(rewriter.current_content)
+                if remaining_keys:
+                    failed_step = 1
+                    step_details[0] = "Dictionary key change leaves existing readers unchanged: " + ", ".join(sorted(remaining_keys))
+            except SyntaxError:
+                pass
+        if failed_step:
+            rewriter.current_content = staged_content
+            rewriter.changes_applied = staged_changes
+            skipped_reasons[idx] = step_details.get(0, "Could not apply to the current staged file")
+            for dependent_idx in graph.get_all_dependents(idx, include_self=False):
+                skipped_reasons[dependent_idx] = f"Depends on failed option: {change.display_title()}"
+            continue
+        if successful_step:
+            selected_changes.append(change)
+    complete_changes = selected_changes
+
+    successful = len(selected_changes)
 
     # Display changes with dependency grouping
     displayed = set()
@@ -899,7 +2512,12 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
 
         priority = change.priority.value if hasattr(change, 'priority') else "UNKNOWN"
 
-        if change in incomplete_changes:
+        if i - 1 in skipped_reasons:
+            change.application_reason = skipped_reasons[i - 1]
+            click.echo(f"   ⏭️  [{i}] {change.display_title()} ({priority})")
+            click.echo(f"      ⏭️  SKIPPED: {skipped_reasons[i - 1]}")
+            click.echo()
+        elif change in incomplete_changes:
             click.echo(f"   ⏭️  [{i}] {change.display_title()} ({priority})")
             click.echo(f"      ⏭️  SKIPPED: Code snippet is truncated/incomplete")
             if _has_real_dependency(getattr(change, 'depends_on', None)):
@@ -915,27 +2533,15 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
 
         displayed.add(i - 1)
 
-    if failed > 0:
-        rewriter.rollback()
-        click.echo(click.style(f"\n   ⚠️  {failed} change(s) could not be applied; rolling back the entire selection.", fg="yellow"))
-        for idx, change in enumerate(complete_changes):
-            if idx in failure_details:
-                reason = failure_details.get(idx, "Code not found in file")
-                click.echo(f"      ❌ {change.display_title()}")
-                note = change.display_note()
-                if note:
-                    click.echo(f"         {click.style(note, fg='blue')}")
-                _render_change_code_block(change)
-                click.echo(f"         Reason: {reason}")
-        click.echo(click.style("   No file changes were written because the refactor set was not fully successful.", fg="yellow"))
-        return False
-
     if successful > 0:
         try:
             rewriter.write()
             _save_diff_report(fpath, rewriter, reports_dir)
+            for change in selected_changes:
+                change.application_status = "applied"
+                change.application_reason = ""
 
-            click.echo(click.style(f"   ✨ Successfully applied {successful} change(s):", fg="green"))
+            click.echo(click.style(f"   ✨ Successfully applied {successful} change(s); skipped {len(skipped_reasons)} suggestion(s):", fg="green"))
             for change in complete_changes[:successful]:
                 click.echo(f"      ✅ {change.display_title()}")
                 note = change.display_note()
@@ -975,20 +2581,171 @@ def _auto_apply(fpath: Path, changes: List, reports_dir: Path, git_commit: bool 
             for change in incomplete_changes:
                 click.echo(f"      ⏭️ {change.display_title()}")
 
-        if failed > 0:
-            click.echo(click.style(f"   ⚠️  All {failed} complete change(s) failed to apply", fg="yellow"))
-            for idx, change in enumerate(complete_changes):
-                if idx in failure_details:
-                    reason = failure_details[idx]
-                    click.echo(f"      ❌ {change.display_title()}")
-                    note = change.display_note()
-                    if note:
-                        click.echo(f"         {click.style(note, fg='blue')}")
-                    _render_change_code_block(change)
-                    click.echo(f"         Reason: {reason}")
-
+    click.echo(click.style("   No applicable changes were written.", fg="yellow"))
     return False
 
+
+
+def _display_failed_remediations(failed_results: list, title: str = "Failed Fixes") -> None:
+    """Display detailed information about failed remediation fixes."""
+    if not failed_results:
+        return
+    
+    click.echo(click.style(f"\n⚠️  {title} - Details:", fg="red", bold=True))
+    for i, result in enumerate(failed_results, 1):
+        result_dict = result.to_dict() if hasattr(result, 'to_dict') else result
+        
+        click.echo(click.style(f"\n  {i}. {result_dict.get('finding_type', 'unknown').upper()}", fg="yellow"))
+        click.echo(f"     File: {result_dict.get('file_path', 'unknown')}")
+        click.echo(f"     Issue: {result_dict.get('issue_description', 'No description')}")
+        
+        error_msg = result_dict.get('error_message')
+        if error_msg:
+            click.echo(f"     Error: {error_msg}")
+        
+        details = result_dict.get('details', {})
+        if details:
+            for key, value in details.items():
+                click.echo(f"     {key}: {value}")
+    
+    click.echo()
+
+
+def _undo_remediation(path: Path) -> None:
+    """Restore remediation changes from backup or git (for audit-security, analyze-deps, gdpr).
+    
+    Handles both single files and directories by finding and restoring from the most recent backups
+    or using git if available for the truly original version.
+    """
+    # Try git first if available (most reliable way to get original)
+    from noorlytics.git_integration import GitIntegration
+    git = GitIntegration()
+    
+    if git.is_git_repo(path.parent):
+        # Use git to restore the file to HEAD version
+        restored_count = 0
+        failed_count = 0
+        
+        if path.is_file():
+            try:
+                # Restore single file from git
+                result = subprocess.run(
+                    ["git", "checkout", "HEAD", path.name],
+                    cwd=path.parent,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    click.echo(click.style(f"✅ Restored {path.name} to git HEAD version", fg="green"))
+                    restored_count = 1
+                else:
+                    click.echo(click.style(f"⚠️  Git restore failed for {path.name}: {result.stderr}", fg="yellow"))
+                    # Fall back to backup restoration below
+                    restored_count = 0
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Git restore failed: {e}", fg="yellow"))
+                restored_count = 0
+        else:
+            # Directory: restore all tracked files
+            try:
+                result = subprocess.run(
+                    ["git", "checkout", "HEAD", "."],
+                    cwd=path,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    click.echo(click.style("✅ Restored all files to git HEAD version", fg="green"))
+                    restored_count = 1
+                else:
+                    click.echo(click.style(f"⚠️  Git restore failed: {result.stderr}", fg="yellow"))
+                    restored_count = 0
+            except Exception as e:
+                click.echo(click.style(f"⚠️  Git restore failed: {e}", fg="yellow"))
+                restored_count = 0
+        
+        if restored_count > 0:
+            return
+        # Fall through to backup restoration if git fails
+    
+    # Fallback: Restore from backups
+    backup_dir = path.parent / ".noor_backups" if path.is_file() else path / ".noor_backups"
+    
+    if not backup_dir.exists():
+        click.echo(click.style("❌ No backups or git history found for remediation changes", fg="red"))
+        return
+    
+    # Get all backups
+    backups = list(backup_dir.glob("*.bak"))
+    if not backups:
+        click.echo(click.style("❌ No backup files found", fg="red"))
+        return
+    
+    # Sort by modification time (oldest first) to restore to original state
+    backups.sort(key=lambda p: p.stat().st_mtime)
+    
+    manager = BackupManager(backup_dir)
+    restored_count = 0
+    failed_count = 0
+    
+    if path.is_file():
+        # Single file: restore from the oldest backup for that file (original state)
+        all_backups_for_file = manager.list_backups(path.name)
+        
+        if not all_backups_for_file:
+            click.echo(click.style(f"❌ No backups found for {path.name}", fg="red"))
+            return
+        
+        # Get the oldest backup (original state before any remediation)
+        oldest_backup = all_backups_for_file[-1]  # list is newest first, so last is oldest
+        
+        if manager.restore_from_backup(path, oldest_backup):
+            click.echo(click.style(f"✅ Restored {path.name} to original state from {oldest_backup.name}", fg="green"))
+            restored_count = 1
+        else:
+            click.echo(click.style(f"❌ Failed to restore {path.name}", fg="red"))
+            failed_count = 1
+    else:
+        # Directory: find and restore all backups in the directory
+        click.echo(click.style("🔄 Restoring all remediation backups...", fg="cyan"))
+        
+        # Group backups by original filename and get the oldest for each
+        backups_by_file = {}
+        for backup_file in backups:
+            # Extract original filename (remove timestamp suffix)
+            # Format: filename.YYYYMMDD_HHMMSS.bak
+            parts = backup_file.stem.rsplit(".", 2)
+            if len(parts) >= 2:
+                original_name = parts[0]
+                if original_name not in backups_by_file:
+                    backups_by_file[original_name] = []
+                backups_by_file[original_name].append(backup_file)
+        
+        # For each file, restore from the oldest backup
+        for original_name, file_backups in backups_by_file.items():
+            # Sort by modification time to get the oldest
+            file_backups.sort(key=lambda p: p.stat().st_mtime)
+            oldest_backup = file_backups[0]  # oldest is first
+            
+            target_file = path / original_name
+            if target_file.exists():
+                try:
+                    target_file.write_text(oldest_backup.read_text(encoding="utf-8"), encoding="utf-8")
+                    click.echo(click.style(f"  ✅ Restored {original_name} to original state", fg="green"))
+                    restored_count += 1
+                except Exception as e:
+                    click.echo(click.style(f"  ❌ Failed to restore {original_name}: {e}", fg="red"))
+                    failed_count += 1
+        
+        if restored_count == 0 and failed_count == 0:
+            click.echo(click.style("⚠️  No files to restore in target directory", fg="yellow"))
+            return
+    
+    # Summary
+    if failed_count == 0:
+        click.echo(click.style(f"\n✅ Successfully restored {restored_count} file(s) to original state", fg="green", bold=True))
+    else:
+        click.echo(click.style(f"\n⚠️  Restored {restored_count} file(s), {failed_count} failed", fg="yellow", bold=True))
 
 
 def _undo_refactoring(path: Path) -> None:
@@ -1030,16 +2787,34 @@ def _save_diff_report(fpath: Path, rewriter: FileRewriter, reports_dir: Path) ->
 @click.option("--status", "-s", is_flag=True, help="Show git status for the repository.")
 @click.option("--branch", "-b", is_flag=True, help="Show current branch name.")
 def git_cmd(file: Path, commit: Optional[str], status: bool, branch: bool):
-    """Manage git operations independently (no refactor needed).
+    """Manage git operations for versioning and committing changes.
     
-    \b
-    Examples:
-        noor git myfile.py --status
-        noor git myfile.py -s
-        noor git myfile.py --branch
-        noor git myfile.py -b
-        noor git myfile.py --commit "my changes"
-        noor git myfile.py -c "my changes"
+    PURPOSE:
+    Interact with git repository for:
+    - Staging and committing analysis/refactor results
+    - Checking current branch and repository status
+    - Managing version control integration
+    - Recording decision history in git
+    
+    PARAMETERS:
+    - file (required): File or directory path in git repo
+    - --commit (-c): Commit message to stage and commit the file
+    - --status (-s): Show git status for repository
+    - --branch (-b): Display current branch name
+    
+    OUTPUTS:
+    - Current branch information
+    - Repository status (staged, unstaged, untracked files)
+    - Confirmation of successful commits
+    - Git integration status
+    
+    EXAMPLES:
+    - noor git myfile.py --status                   # Show status
+    - noor git myfile.py -s                         # Short form
+    - noor git myfile.py --branch                   # Current branch
+    - noor git myfile.py -b                         # Short form
+    - noor git myfile.py --commit "Initial analysis" # Stage and commit
+    - noor git myfile.py -c "Fixed security issues" # Short form
     """
     
     # Check if in a git repo
@@ -1077,6 +2852,18 @@ def git_cmd(file: Path, commit: Optional[str], status: bool, branch: bool):
                 click.echo(click.style(f"❌ Failed to stage: {file.name}", fg="red"))
         else:
             click.echo(click.style(f"❌ File not found: {file}", fg="red"))
+
+
+# -------------------- Phase 3: Decision Intelligence CLI Groups --------------------
+
+# Add decision management commands
+cli.add_command(decisions, name="decisions")
+
+# Add decision history commands  
+cli.add_command(history, name="history")
+
+# Add analytics and metrics commands
+cli.add_command(metrics, name="metrics")
 
 
 # -------------------- Entrypoint --------------------

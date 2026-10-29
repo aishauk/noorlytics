@@ -1,0 +1,17 @@
+{
+  "customer_name": "E-Commerce Startup",
+  "industry": "retail",
+  "deployment": "customer-facing",
+  "risk_preferences": {
+    "security": "medium",
+    "business_continuity": "high",
+    "cost_control": "high",
+    "delivery_speed": "high"
+  },
+  "constraints": {
+    "upgrade_window_days": 30,
+    "requires_oss_license_review": false,
+    "legacy_runtime": null,
+    "min_security_score": 6
+  }
+}

@@ -4,12 +4,20 @@ import json
 import re
 import subprocess
 import sys
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
 from .settings import get_settings
 from . import net
 from .llm_interface import LLMClient
+from .findings import (
+    VerifiedFinding,
+    FindingsCollection,
+    FindingBuilder,
+    FindingType,
+    ConfidenceLevel,
+)
 
 
 # ---------------- Ecosystem detection ----------------
@@ -121,16 +129,44 @@ RISKY_LICENSES = {
     None
 }
 
+LOCAL_LICENSE_ALIASES = {
+    "click": "BSD-3-Clause",
+    "setuptools": "MIT",
+    "typing-extensions": "PSF",
+    "python-dotenv": "BSD-3-Clause",
+    "requests": "Apache-2.0",
+    "urllib3": "MIT",
+    "rich": "MIT",
+}
+
 PERMISSIVE_HINTS = {
     "MIT",
     "APACHE",
     "APACHE-2.0",
     "BSD",
     "BSD-3-CLAUSE",
+    "PSF",
     "ISC",
     "MPL",
     "MPL-2.0"
 }
+
+
+def _normalize_package_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", str(name).strip().lower())
+
+
+def _get_local_license_alias(pkg: str) -> Optional[str]:
+    normalized = _normalize_package_name(pkg)
+
+    if normalized in LOCAL_LICENSE_ALIASES:
+        return LOCAL_LICENSE_ALIASES[normalized]
+
+    for alias, license_name in LOCAL_LICENSE_ALIASES.items():
+        if normalized.endswith(alias) or alias.endswith(normalized):
+            return license_name
+
+    return None
 
 
 def _normalize_license_name(lic_raw: Optional[str]) -> str:
@@ -138,18 +174,18 @@ def _normalize_license_name(lic_raw: Optional[str]) -> str:
         return "UNKNOWN"
 
     lic = str(lic_raw).strip().strip('"').strip("'")
-    u = lic.upper().replace(" LICENSE", "").replace("LICENCE", "").strip()
+    u = lic.upper().replace(" LICENSE", "").replace("LICENCE", "").replace("BSD LICENSE", "BSD").strip()
 
+    if "APACHE SOFTWARE LICENSE" in u or "APACHE" in u and ("2" in u or "SOFTWARE" in u):
+        return "Apache-2.0"
     if "APACHE" in u and "2" in u:
         return "Apache-2.0"
     if u in {"APACHE", "APACHE2", "APACHE-2"}:
         return "Apache-2.0"
     if "MIT" in u:
         return "MIT"
-    if "BSD-3" in u or ("BSD" in u and "3" in u):
+    if "BSD-3" in u or ("BSD" in u and "3" in u) or u == "BSD":
         return "BSD-3-Clause"
-    if u == "BSD":
-        return "BSD"
     if "ISC" in u:
         return "ISC"
     if "MPL" in u and "2" in u:
@@ -164,16 +200,48 @@ def _normalize_license_name(lic_raw: Optional[str]) -> str:
         return "LGPL-3.0"
     if "LGPL-2" in u or ("LGPL" in u and "2" in u):
         return "LGPL-2.1"
+    if "PSF" in u:
+        return "PSF"
     if u in {"UNKNOWN", "NONE", ""}:
         return "UNKNOWN"
 
     return lic
 
 
+def _extract_license_from_local_metadata(pkg: str) -> Optional[str]:
+    try:
+        meta = importlib_metadata.metadata(pkg)
+    except Exception:
+        return None
+
+    check_values: List[str] = []
+    license_value = meta.get("License")
+    if license_value:
+        check_values.append(license_value)
+
+    for classifier in meta.get_all("Classifier") or []:
+        if "license" in classifier.lower():
+            check_values.append(classifier)
+
+    for candidate in check_values:
+        if not candidate:
+            continue
+        if "::" in candidate:
+            parts = [p.strip() for p in candidate.split("::") if p.strip()]
+            if len(parts) >= 2 and parts[-1].lower() not in {"osi approved"}:
+                return parts[-1]
+        return candidate
+
+    return None
+
+
 def _risk_from_license(lic: str) -> str:
     up = lic.upper()
 
-    if any(bad in up for bad in ("AGPL", "GPL", "LGPL")) or up in {"UNKNOWN", "NONE"}:
+    if up in {"UNKNOWN", "NONE"}:
+        return "unknown"
+
+    if any(bad in up for bad in ("AGPL", "GPL", "LGPL")):
         return "high"
 
     if any(ok in up for ok in PERMISSIVE_HINTS):
@@ -219,6 +287,8 @@ def _format_risk_chip(risk: str) -> str:
             chip.stylize("bold white on red")
         elif risk == "medium":
             chip.stylize("bold black on yellow")
+        elif risk == "unknown":
+            chip.stylize("bold white on grey23")
         else:
             chip.stylize("bold white on green")
 
@@ -434,7 +504,7 @@ def _expand_from_lockfiles(project_root: Path, eco: str) -> Tuple[List[Dict[str,
 
 # ---------------- Offline license detection ----------------
 
-def _detect_license_python(pkg: str) -> Tuple[str, str]:
+def _detect_license_python(pkg: str, allow_network: bool = False) -> Tuple[str, str]:
     try:
         out = subprocess.check_output(
             [sys.executable, "-m", "pip", "show", pkg],
@@ -456,6 +526,19 @@ def _detect_license_python(pkg: str) -> Tuple[str, str]:
 
     except Exception:
         pass
+
+    alias = _get_local_license_alias(pkg)
+    if alias:
+        return _normalize_license_name(alias), "local-alias"
+
+    local_meta = _extract_license_from_local_metadata(pkg)
+    if local_meta:
+        lic = _normalize_license_name(local_meta)
+        if lic != "UNKNOWN":
+            return lic, "local-metadata"
+
+    if not allow_network:
+        return "UNKNOWN", "local-only"
 
     try:
         r = net.session().get(f"https://pypi.org/pypi/{pkg}/json", timeout=5)
@@ -479,7 +562,7 @@ def _detect_license_python(pkg: str) -> Tuple[str, str]:
     return "UNKNOWN", "unknown"
 
 
-def _detect_license_node(pkg: str, project_root: Path, version_hint: Optional[str]) -> Tuple[str, str]:
+def _detect_license_node(pkg: str, project_root: Path, version_hint: Optional[str], allow_network: bool = False) -> Tuple[str, str]:
     try:
         pkg_json = project_root / "node_modules" / pkg / "package.json"
 
@@ -497,6 +580,9 @@ def _detect_license_node(pkg: str, project_root: Path, version_hint: Optional[st
 
     except Exception:
         pass
+
+    if not allow_network:
+        return "UNKNOWN", "local-only"
 
     try:
         ver = None
@@ -526,7 +612,10 @@ def _detect_license_node(pkg: str, project_root: Path, version_hint: Optional[st
     return "UNKNOWN", "unknown"
 
 
-def _detect_license_nuget(pkg: str, version_hint: Optional[str]) -> Tuple[str, str]:
+def _detect_license_nuget(pkg: str, version_hint: Optional[str], allow_network: bool = False) -> Tuple[str, str]:
+    if not allow_network:
+        return "UNKNOWN", "local-only"
+
     try:
         registration_url = f"https://api.nuget.org/v3/registration5-semver1/{pkg.lower()}/index.json"
         r = net.session().get(registration_url, timeout=6)
@@ -625,7 +714,10 @@ def _severity_from_osv_vuln(v: Dict[str, Any]) -> str:
     return sev_label or "UNKNOWN"
 
 
-def _osv_querybatch(ecosystem: str, pkgs: List[Tuple[str, Optional[str]]]) -> List[Dict[str, Optional[str]]]:
+def _osv_querybatch(ecosystem: str, pkgs: List[Tuple[str, Optional[str]]], allow_network: bool = False) -> List[Dict[str, Optional[str]]]:
+    if not allow_network:
+        return []
+
     queries = []
     names: List[str] = []
     versions: List[str] = []
@@ -805,27 +897,31 @@ def _dedupe_vulns(vulns: List[Dict[str, Optional[str]]]) -> List[Dict[str, Optio
     return out
 
 
-def _collect_known_vulns(path: Path, eco: str, deps: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Optional[str]]], Dict[str, str]]:
+def _collect_known_vulns(path: Path, eco: str, deps: List[Dict[str, Any]], allow_network: bool = False) -> Tuple[List[Dict[str, Optional[str]]], Dict[str, str]]:
     sources: Dict[str, str] = {}
     vulns: List[Dict[str, Optional[str]]] = []
 
     if eco == "node":
-        osv = _osv_querybatch("npm", [(d["name"], d.get("version")) for d in deps])
+        osv = _osv_querybatch("npm", [(d["name"], d.get("version")) for d in deps], allow_network=allow_network)
 
         if osv:
             vulns.extend(osv)
             sources["node"] = "osv"
+        elif not allow_network:
+            sources["node"] = "offline-local-only"
 
     elif eco == "python":
-        osv = _osv_querybatch("pypi", [(d["name"], d.get("version")) for d in deps])
+        osv = _osv_querybatch("pypi", [(d["name"], d.get("version")) for d in deps], allow_network=allow_network)
 
         if osv:
             vulns.extend(osv)
             sources["python"] = "osv"
+        elif not allow_network:
+            sources["python"] = "offline-local-only"
 
     elif eco == "dotnet":
-        osv = _osv_querybatch("nuget", [(d["name"], d.get("version")) for d in deps])
-        fallback = _dotnet_fallback_vulns(deps)
+        osv = _osv_querybatch("nuget", [(d["name"], d.get("version")) for d in deps], allow_network=allow_network)
+        fallback = _dotnet_fallback_vulns(deps) if allow_network else []
 
         if osv:
             vulns.extend(osv)
@@ -836,14 +932,14 @@ def _collect_known_vulns(path: Path, eco: str, deps: List[Dict[str, Any]]) -> Tu
             sources["dotnet_fallback"] = "curated-known-nuget-findings"
 
         if not osv and not fallback:
-            sources["dotnet"] = "osv-no-high-critical-found"
+            sources["dotnet"] = "offline-local-only" if not allow_network else "osv-no-high-critical-found"
 
     return _dedupe_vulns(vulns), sources
 
 
 # ---------------- Main dependency analysis ----------------
 
-def analyze_dependencies_file(path: Path, client: LLMClient) -> Dict[str, Any]:
+def analyze_dependencies_file(path: Path, allow_network: bool = False) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     eco = detect_ecosystem(path.name, text)
 
@@ -882,11 +978,11 @@ def analyze_dependencies_file(path: Path, client: LLMClient) -> Dict[str, Any]:
         ver_hint = d.get("version")
 
         if eco == "python":
-            lic, src = _detect_license_python(name)
+            lic, src = _detect_license_python(name, allow_network=allow_network)
         elif eco == "node":
-            lic, src = _detect_license_node(name, path.parent, ver_hint)
+            lic, src = _detect_license_node(name, path.parent, ver_hint, allow_network=allow_network)
         elif eco == "dotnet":
-            lic, src = _detect_license_nuget(name, ver_hint)
+            lic, src = _detect_license_nuget(name, ver_hint, allow_network=allow_network)
         else:
             lic, src = "UNKNOWN", "unknown"
 
@@ -901,7 +997,18 @@ def analyze_dependencies_file(path: Path, client: LLMClient) -> Dict[str, Any]:
 
         license_sources[name] = src
 
-    known_vulns, vuln_sources = _collect_known_vulns(path, eco, deps)
+    known_vulns, vuln_sources = _collect_known_vulns(path, eco, deps, allow_network=allow_network)
+
+    # ---- Standards Compliance Check ----
+    standards_compliance = []
+    for d in deps:
+        pkg_name = d["name"]
+        pkg_version = d.get("version")
+        
+        # Check compliance against all standards
+        from .scan_standards import check_dependency_standards
+        compliance_issues = check_dependency_standards(pkg_name, pkg_version, standard="all")
+        standards_compliance.extend(compliance_issues)
 
     risk_lines: List[str] = []
     risk_lines.append("**Known high-profile vulnerabilities:**")
@@ -1035,6 +1142,92 @@ def analyze_dependencies_file(path: Path, client: LLMClient) -> Dict[str, Any]:
         "license_sources": license_sources,
         "vulnerability_sources": vuln_sources,
         "known_vulns": known_vulns,
+        "standards_compliance": standards_compliance,
         "notes_md": notes_md,
         "notes_sections": notes_sections,
+        "network_mode": "online" if allow_network else "offline",
+        "allow_network": allow_network,
     }
+
+
+def transform_analysis_to_findings(
+    analysis_result: Dict[str, Any],
+) -> FindingsCollection:
+    """Transform dependency analysis result into normalized verified findings.
+
+    Args:
+        analysis_result: Output from analyze_dependencies_file()
+
+    Returns:
+        FindingsCollection with all findings normalized and tagged
+    """
+    manifest_path = analysis_result.get("file", "")
+    collection = FindingsCollection(manifest_path=manifest_path)
+
+    # Map known vulnerabilities
+    for vuln in analysis_result.get("known_vulns", []):
+        finding = FindingBuilder.vulnerability(
+            package=vuln.get("name", "unknown"),
+            current_version=vuln.get("version", "unknown"),
+            advisory_id=vuln.get("id", "unknown-advisory"),
+            severity=vuln.get("severity", "high").lower(),
+            fix_version=vuln.get("fix_version"),
+            source="osv",
+            manifest_path=manifest_path,
+        )
+        collection.add(finding)
+
+    # Map risky licenses
+    for lic in analysis_result.get("license_risk", []):
+        risk = lic.get("risk", "low")
+        lic_name = lic.get("license", "UNKNOWN")
+
+        if lic_name.upper() == "UNKNOWN":
+            finding = FindingBuilder.license_unknown(
+                package=lic.get("name", "unknown"),
+                version=None,
+                source=analysis_result.get("license_sources", {}).get(
+                    lic.get("name", ""), "manifest"
+                ),
+                manifest_path=manifest_path,
+            )
+        elif risk == "high":
+            finding = FindingBuilder.license_risk(
+                package=lic.get("name", "unknown"),
+                license_name=lic_name,
+                version=None,
+                source=analysis_result.get("license_sources", {}).get(
+                    lic.get("name", ""), "manifest"
+                ),
+                manifest_path=manifest_path,
+            )
+        else:
+            continue  # Skip low/medium risk licenses
+
+        collection.add(finding)
+
+    # Map unpinned dependencies
+    for dep in analysis_result.get("dependencies", []):
+        if not dep.get("version"):
+            finding = FindingBuilder.unpinned_dependency(
+                package=dep.get("name", "unknown"),
+                source="manifest",
+                manifest_path=manifest_path,
+            )
+            collection.add(finding)
+
+    # Map legacy dependencies (dotnet specific)
+    if analysis_result.get("ecosystem") == "dotnet":
+        for dep in analysis_result.get("dependencies", []):
+            version = dep.get("version", "")
+            if version and re.match(r"^[0-3]\.", str(version)):
+                finding = FindingBuilder.legacy_dependency(
+                    package=dep.get("name", "unknown"),
+                    version=version,
+                    ecosystem="dotnet",
+                    source="heuristic",
+                    manifest_path=manifest_path,
+                )
+                collection.add(finding)
+
+    return collection
