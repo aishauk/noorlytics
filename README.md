@@ -72,7 +72,7 @@ export OPENAI_API_KEY="your-key"
 | **scan-standards** | Check compliance with HIPAA, PCI-DSS, SOC2, ISO27001, FedRAMP | `noor scan-standards src/ --standard hipaa`         |
 | **unified-scan**   | Merge security and compliance findings into one report        | `noor unified-scan .`                               |
 
-### Cache Management (Phase 5 & Phase C)
+### Cache Management
 
 | Command                | Purpose                                                   | Usage                                              |
 | ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
@@ -81,7 +81,7 @@ export OPENAI_API_KEY="your-key"
 | **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
 | **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
 
-### Decision Management (Phase 3)
+### Decision Management
 
 | Command       | Purpose                                                                         | Usage                                         |
 | ------------- | ------------------------------------------------------------------------------- | --------------------------------------------- |
