@@ -8,7 +8,7 @@
 
 | Requirement          | Version                          |
 | -------------------- | -------------------------------- |
-| Python               | 3.10+                            |
+| Python               | 3.11+                            |
 | Backend (choose one) | Ollama (local) OR OpenAI API key |
 | Shell                | Bash or Zsh                      |
 
