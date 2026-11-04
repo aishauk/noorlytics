@@ -28,6 +28,8 @@ dependencies = [
   "typing-extensions",
   "setuptools",
   "psutil",
+  "packaging",
+  "tomli; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

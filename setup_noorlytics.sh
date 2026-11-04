@@ -18,7 +18,7 @@ _noor_setup() {
     fi
 
     _noor_python=""
-    for _noor_candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+    for _noor_candidate in python3.14 python3.13 python3.12 python3.11 python3; do
         if command -v "$_noor_candidate" >/dev/null 2>&1 && "$_noor_candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
             _noor_python="$_noor_candidate"
             break
@@ -26,7 +26,7 @@ _noor_setup() {
     done
 
     if [[ -z "$_noor_python" ]]; then
-        echo "Python 3.10 or newer is required. Install it, then run: source setup_noorlytics.sh"
+        echo "Python 3.11 or newer is required. Install it, then run: source setup_noorlytics.sh"
         return 1
     fi
 
@@ -45,6 +45,8 @@ _noor_setup() {
     fi
 
     "$_noor_venv_python" -m pip install --upgrade pip || return 1
+    # Regenerate stale setuptools metadata so the installed console script matches pyproject.toml.
+    rm -rf noorlytics.egg-info || return 1
     "$_noor_venv_python" -m pip install -e "$_noor_install_target" || return 1
 
     if [[ ! -f ".env" && -f ".env.sample" ]]; then
@@ -58,8 +60,9 @@ _noor_setup() {
         set +a
     fi
 
-    printf 'Noorlytics is ready: %s\n' "$(noor --version)"
-    printf 'Using noor from: %s\n' "$(command -v noor)"
+    _noor_version=$("$PWD/.venv/bin/noor" --version) || return 1
+    printf 'Noorlytics is ready: %s\n' "$_noor_version"
+    printf 'Using noor from: %s\n' "$PWD/.venv/bin/noor"
 
     if [[ "$_noor_install_target" == ".[openai]" ]]; then
         if [[ -z "${OPENAI_API_KEY:-}" ]]; then
@@ -79,5 +82,5 @@ _noor_setup() {
 _noor_setup
 _noor_exit_code=$?
 unset -f _noor_setup
-unset _noor_candidate _noor_install_target _noor_python _noor_venv_python
+unset _noor_candidate _noor_install_target _noor_python _noor_venv_python _noor_version
 return "$_noor_exit_code" 2>/dev/null || exit "$_noor_exit_code"

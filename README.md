@@ -286,6 +286,13 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 --undo                 # Restore from backup
 ```
 
+`analyze-deps` follows dependencies recursively from the direct requirements in
+the manifest, using the matching lockfile to determine resolved package versions
+and dependency edges. It currently supports `package-lock.json` for Node.js and
+`uv.lock`, `poetry.lock`, or `Pipfile.lock` for Python. Without a supported
+lockfile next to the manifest, it can only analyze the dependencies declared
+directly in that manifest.
+
 ### audit-security
 
 ```bash

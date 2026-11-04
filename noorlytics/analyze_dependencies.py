@@ -8,6 +8,9 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
+
 from .settings import get_settings
 from . import net
 from .llm_interface import LLMClient
@@ -57,7 +60,8 @@ def parse_requirements_txt(text: str) -> List[Tuple[str, Optional[str]]]:
         )
 
         if m:
-            out.append((m.group(1), m.group(2)))
+            pinned_version = m.group(2) if "==" in line else None
+            out.append((m.group(1), pinned_version))
 
     return out
 
@@ -78,6 +82,60 @@ def parse_package_json(text: str) -> Dict[str, str]:
 
 
 def parse_pyproject(text: str) -> List[Tuple[str, Optional[str]]]:
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            tomllib = None
+
+    if tomllib is not None:
+        try:
+            data = tomllib.loads(text)
+        except (ValueError, TypeError):
+            data = {}
+
+        project = data.get("project", {})
+        dependencies: List[str] = []
+        if isinstance(project.get("dependencies"), list):
+            dependencies.extend(project["dependencies"])
+        optional = project.get("optional-dependencies", {})
+        if isinstance(optional, dict):
+            for group in optional.values():
+                if isinstance(group, list):
+                    dependencies.extend(group)
+
+        poetry = data.get("tool", {}).get("poetry", {})
+        poetry_deps = poetry.get("dependencies", {})
+        if isinstance(poetry_deps, dict):
+            dependencies.extend(
+                f"{name}{value}" if isinstance(value, str) else name
+                for name, value in poetry_deps.items()
+                if name.lower() != "python"
+            )
+        for group in poetry.get("group", {}).values():
+            group_deps = group.get("dependencies", {}) if isinstance(group, dict) else {}
+            if isinstance(group_deps, dict):
+                dependencies.extend(
+                    f"{name}{value}" if isinstance(value, str) else name
+                    for name, value in group_deps.items()
+                    if name.lower() != "python"
+                )
+
+        parsed: List[Tuple[str, Optional[str]]] = []
+        for requirement in dependencies:
+            match = re.match(
+                r"\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*(.*)",
+                requirement,
+            )
+            if not match:
+                continue
+            version_match = re.search(r"==\s*([A-Za-z0-9_.+-]+)", match.group(2))
+            parsed.append((match.group(1), version_match.group(1) if version_match else None))
+        if dependencies:
+            return parsed
+
     pkgs: List[Tuple[str, Optional[str]]] = []
 
     for line in text.splitlines():
@@ -90,7 +148,7 @@ def parse_pyproject(text: str) -> List[Tuple[str, Optional[str]]]:
             name = re.split(r"[><=~! ]+", line)[0]
             version = None
 
-            m = re.search(r"([0-9]+\.[0-9]+(?:\.[0-9]+)?)", line)
+            m = re.search(r"==\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", line)
 
             if m:
                 version = m.group(1)
@@ -393,109 +451,289 @@ def render_notes_cli(notes_sections: Dict[str, List[str]], license_risk: List[Di
 
 # ---------------- Transitives lockfiles ----------------
 
-def _collect_node_transitives(lock_path: Path) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
+def _package_key(name: str, version: Optional[str]) -> str:
+    return f"{_normalize_package_name(name)}@{version or ''}"
+
+
+def _resolve_lock_graph(
+    records: List[Dict[str, Any]],
+    direct_dependencies: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Optional[str]]]:
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        name = record.get("name")
+        if not name:
+            continue
+        normalized = _normalize_package_name(name)
+        by_name.setdefault(normalized, []).append(record)
+        by_key[_package_key(name, record.get("version"))] = record
+
+    if direct_dependencies is None:
+        roots = [{"name": record["name"], "version": None} for record in records]
+    elif direct_dependencies:
+        roots = direct_dependencies
+    else:
+        roots = [
+            {"name": record["name"], "version": None}
+            for record in records
+            if record.get("root")
+        ]
+    pending: List[Dict[str, Any]] = []
+    for dependency in roots:
+        candidates = by_name.get(_normalize_package_name(dependency["name"]), [])
+        hinted_version = dependency.get("version")
+        exact = [r for r in candidates if hinted_version and r.get("version") == hinted_version]
+        pending.extend(exact or candidates)
+
+    visited: set[str] = set()
+    resolved: List[Dict[str, Optional[str]]] = []
+    while pending:
+        current = pending.pop()
+        key = _package_key(current["name"], current.get("version"))
+        if key in visited:
+            continue
+        visited.add(key)
+        resolved.append({"name": current["name"], "version": current.get("version")})
+        for child in current.get("dependencies", []):
+            exact = by_key.get(_package_key(child["name"], child.get("version")))
+            if exact is not None:
+                pending.append(exact)
+            else:
+                candidates = by_name.get(_normalize_package_name(child["name"]), [])
+                constraint = child.get("constraint") or child.get("version")
+                if constraint:
+                    specifier_text = str(constraint).strip()
+                    if specifier_text.startswith("^"):
+                        lower = specifier_text[1:]
+                        try:
+                            parsed = Version(lower)
+                            release = list(parsed.release)
+                            boundary_index = next(
+                                (index for index, value in enumerate(release) if value != 0),
+                                0,
+                            )
+                            upper_release = release[:boundary_index + 1]
+                            upper_release[boundary_index] += 1
+                            upper_release.extend([0] * (len(release) - len(upper_release)))
+                            upper = ".".join(map(str, upper_release))
+                            specifier_text = f">={lower},<{upper}"
+                        except InvalidVersion:
+                            specifier_text = ""
+                    elif specifier_text.startswith("~") and not specifier_text.startswith("~="):
+                        lower = specifier_text[1:]
+                        try:
+                            parsed = Version(lower)
+                            release = list(parsed.release)
+                            index = max(len(release) - 2, 1) if len(release) > 1 else 0
+                            upper_release = release[:index + 1]
+                            upper_release[index] += 1
+                            upper_release.extend([0] * (len(release) - len(upper_release)))
+                            upper = ".".join(map(str, upper_release))
+                            specifier_text = f">={lower},<{upper}"
+                        except InvalidVersion:
+                            specifier_text = ""
+                    elif re.fullmatch(r"[0-9][A-Za-z0-9.+!-]*", specifier_text):
+                        specifier_text = f"=={specifier_text}"
+
+                    try:
+                        specifier = SpecifierSet(specifier_text)
+                        versioned = [record for record in candidates if record.get("version")]
+                        matching = []
+                        for record in versioned:
+                            try:
+                                if Version(str(record["version"])) in specifier:
+                                    matching.append(record)
+                            except InvalidVersion:
+                                continue
+                        if versioned:
+                            candidates = matching
+                    except (InvalidSpecifier, InvalidVersion):
+                        pass
+                pending.extend(candidates)
+    return resolved
+
+
+def _collect_node_transitives(
+    lock_path: Path,
+    direct_dependencies: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
     try:
         data = json.loads(lock_path.read_text(encoding="utf-8"))
-    except Exception:
-        return [], []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read npm lockfile {lock_path}: {exc}") from exc
 
-    collected: Dict[str, Dict[str, Optional[str]]] = {}
-
-    def walk(node: Dict[str, Any]):
-        deps = node.get("dependencies", {}) or {}
-
-        for name, meta in deps.items():
-            ver = meta.get("version")
-            key = f"{name}@{ver}" if ver else name
-
-            if key in collected:
+    records: List[Dict[str, Any]] = []
+    if isinstance(data.get("packages"), dict):
+        packages = data["packages"]
+        for package_path, metadata in packages.items():
+            if not package_path or not isinstance(metadata, dict):
                 continue
-
-            collected[key] = {
+            name = metadata.get("name")
+            if not name:
+                match = re.search(r"(?:^|/)node_modules/(@[^/]+/[^/]+|[^/]+)$", package_path)
+                name = match.group(1) if match else None
+            if not name:
+                continue
+            records.append({
                 "name": name,
-                "version": ver
-            }
+                "version": metadata.get("version"),
+                "dependencies": [
+                    {"name": child}
+                    for group in ("dependencies", "optionalDependencies", "peerDependencies")
+                    for child in (metadata.get(group) or {})
+                ],
+                "location": package_path,
+            })
 
-            walk(meta)
-
-    if "packages" in data and isinstance(data["packages"], dict):
-        root = {
-            "dependencies": data.get("dependencies", {})
-        }
-        walk(root)
+        # Prefer the nearest nested installation for a dependency edge.
+        by_location = {record["location"]: record for record in records}
+        for record in records:
+            children: List[Dict[str, Optional[str]]] = []
+            parent = record["location"]
+            for group in ("dependencies", "optionalDependencies", "peerDependencies"):
+                metadata = packages.get(parent, {})
+                for child_name in (metadata.get(group) or {}):
+                    location = parent
+                    candidate = None
+                    while True:
+                        candidate = f"{location}/node_modules/{child_name}" if location else f"node_modules/{child_name}"
+                        if candidate in by_location:
+                            break
+                        if not location:
+                            candidate = None
+                            break
+                        location = location.rsplit("/node_modules/", 1)[0] if "/node_modules/" in location else ""
+                    if candidate and candidate in by_location:
+                        child = by_location[candidate]
+                        children.append({"name": child["name"], "version": child.get("version")})
+            record["dependencies"] = children
     else:
-        walk(data)
+        def add_legacy_dependencies(dependencies: Dict[str, Any]) -> None:
+            for name, metadata in dependencies.items():
+                if not isinstance(metadata, dict):
+                    continue
+                record = {
+                    "name": name,
+                    "version": metadata.get("version"),
+                    "dependencies": [],
+                }
+                records.append(record)
+                record["dependencies"] = [
+                    {"name": child, "version": child_metadata.get("version")}
+                    for child, child_metadata in (metadata.get("dependencies") or {}).items()
+                    if isinstance(child_metadata, dict)
+                ]
+                add_legacy_dependencies(metadata.get("dependencies") or {})
+
+        add_legacy_dependencies(data.get("dependencies") or {})
 
     src = [{
         "type": "node-lockfile",
         "path": str(lock_path)
     }]
 
-    return list(collected.values()), src
+    return _resolve_lock_graph(records, direct_dependencies), src
 
 
-def _collect_poetry_transitives(lock_path: Path) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
-    text = lock_path.read_text(encoding="utf-8", errors="ignore")
-    pkgs: List[Dict[str, Optional[str]]] = []
-    current = None
+def _load_toml(path: Path) -> Dict[str, Any]:
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError as exc:
+            raise RuntimeError("TOML lockfile parsing requires Python 3.11+ or the tomli package") from exc
 
-    for line in text.splitlines():
-        s = line.strip()
+    return tomllib.loads(path.read_text(encoding="utf-8"))
 
-        if s.startswith("[[package]]"):
-            if current:
-                pkgs.append(current)
 
-            current = {
-                "name": None,
-                "version": None
-            }
-
-        elif s.startswith("name =") and current is not None:
-            current["name"] = s.split("=", 1)[1].strip().strip('"\'')
-
-        elif s.startswith("version =") and current is not None:
-            current["version"] = s.split("=", 1)[1].strip().strip('"\'')
-
-    if current:
-        pkgs.append(current)
-
-    seen = set()
-    out = []
-
-    for p in pkgs:
-        key = f"{p.get('name')}@{p.get('version')}"
-
-        if key not in seen and p.get("name"):
-            out.append({
-                "name": p.get("name"),
-                "version": p.get("version")
+def _collect_python_lock_transitives(
+    lock_path: Path,
+    lock_type: str,
+    direct_dependencies: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
+    records: List[Dict[str, Any]] = []
+    if lock_type == "pipenv":
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        for section in ("default", "develop"):
+            for name, metadata in (data.get(section) or {}).items():
+                if not isinstance(metadata, dict):
+                    continue
+                records.append({
+                    "name": name,
+                    "version": str(metadata.get("version", "")).lstrip("=") or None,
+                    "dependencies": [
+                        {"name": child, "constraint": constraint}
+                        for child, constraint in (metadata.get("dependencies") or {}).items()
+                    ],
+                })
+        source_type = "pipenv-lock"
+    else:
+        data = _load_toml(lock_path)
+        packages = data.get("package", [])
+        for package in packages:
+            dependencies = package.get("dependencies", [])
+            if isinstance(dependencies, dict):
+                children = [
+                    {
+                        "name": name,
+                        "constraint": value.get("version") if isinstance(value, dict) else value,
+                    }
+                    for name, value in dependencies.items()
+                ]
+            else:
+                children = [
+                    {
+                        "name": dep["name"],
+                        "version": dep.get("version"),
+                        "constraint": dep.get("version"),
+                    }
+                    for dep in dependencies
+                    if isinstance(dep, dict) and dep.get("name")
+                ]
+            records.append({
+                "name": package.get("name"),
+                "version": package.get("version"),
+                "dependencies": children,
+                "root": bool(package.get("source", {}).get("virtual")),
             })
-            seen.add(key)
+        source_type = "python-uv-lock" if lock_type == "uv" else "python-poetry-lock"
 
     src = [{
-        "type": "python-poetry-lock",
+        "type": source_type,
         "path": str(lock_path)
     }]
 
-    return out, src
+    return _resolve_lock_graph(records, direct_dependencies), src
 
 
-def _expand_from_lockfiles(project_root: Path, eco: str) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
+def _expand_from_lockfiles(
+    project_root: Path,
+    eco: str,
+    direct_dependencies: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Optional[str]]], List[Dict[str, str]]]:
     if eco == "node":
         p = project_root / "package-lock.json"
 
         if p.exists():
-            return _collect_node_transitives(p)
+            return _collect_node_transitives(p, direct_dependencies)
 
         return [], []
 
     if eco == "python":
-        for lock in ("poetry.lock", "Pipfile.lock"):
+        for lock, lock_type in (
+            ("uv.lock", "uv"),
+            ("poetry.lock", "poetry"),
+            ("Pipfile.lock", "pipenv"),
+        ):
             p = project_root / lock
 
             if p.exists():
-                return _collect_poetry_transitives(p)
+                try:
+                    return _collect_python_lock_transitives(p, lock_type, direct_dependencies)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"Could not read dependency lockfile {p}: {exc}") from exc
 
         return [], []
 
@@ -961,14 +1199,15 @@ def analyze_dependencies_file(path: Path, allow_network: bool = False) -> Dict[s
         pairs = parse_packages_config(text)
         deps = [{"name": n, "version": v} for (n, v) in pairs]
 
-    transitive, _ = _expand_from_lockfiles(path.parent, eco)
+    transitive, dependency_sources = _expand_from_lockfiles(path.parent, eco, deps)
 
     if transitive:
-        existing = {(d["name"], d.get("version")) for d in deps}
-
-        for td in transitive:
-            if (td["name"], td.get("version")) not in existing:
-                deps.append(td)
+        resolved_names = {_normalize_package_name(d["name"]) for d in transitive}
+        deps = [
+            d for d in deps
+            if _normalize_package_name(d["name"]) not in resolved_names
+        ]
+        deps.extend(transitive)
 
     license_risk: List[Dict[str, Any]] = []
     license_sources: Dict[str, str] = {}
@@ -1138,6 +1377,7 @@ def analyze_dependencies_file(path: Path, allow_network: bool = False) -> Dict[s
         "file": str(path),
         "ecosystem": eco,
         "dependencies": deps,
+        "dependency_sources": dependency_sources,
         "license_risk": license_risk,
         "license_sources": license_sources,
         "vulnerability_sources": vuln_sources,
