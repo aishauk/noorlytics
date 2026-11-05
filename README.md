@@ -72,15 +72,6 @@ export OPENAI_API_KEY="your-key"
 | **scan-standards** | Check compliance with HIPAA, PCI-DSS, SOC2, ISO27001, FedRAMP | `noor scan-standards src/ --standard hipaa`         |
 | **unified-scan**   | Merge security and compliance findings into one report        | `noor unified-scan .`                               |
 
-### Cache Management
-
-| Command                | Purpose                                                   | Usage                                              |
-| ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
-| **cache stats**        | Show cache statistics (analysis + remediation)            | `noor cache stats`                                 |
-| **cache clear**        | Clear all cached findings and remediation results         | `noor cache clear` or `noor cache clear --confirm` |
-| **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
-| **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
-
 ### Decision Management
 
 | Command       | Purpose                                                                         | Usage                                         |
@@ -89,6 +80,15 @@ export OPENAI_API_KEY="your-key"
 | **decisions** | Query stored decisions (list, show, export)                                     | `noor decisions list --priority P1`           |
 | **history**   | Track and compare decision versions over time                                   | `noor history show requirements.txt`          |
 | **metrics**   | View decision analytics dashboards and trends                                   | `noor metrics dashboard --period 30`          |
+
+### Cache Management
+
+| Command                | Purpose                                                   | Usage                                              |
+| ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
+| **cache stats**        | Show cache statistics (analysis + remediation)            | `noor cache stats`                                 |
+| **cache clear**        | Clear all cached findings and remediation results         | `noor cache clear` or `noor cache clear --confirm` |
+| **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
+| **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
 
 ---
 
