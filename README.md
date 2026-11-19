@@ -8,7 +8,7 @@
 
 | Requirement          | Version                          |
 | -------------------- | -------------------------------- |
-| Python               | 3.10+                            |
+| Python               | 3.11+                            |
 | Backend (choose one) | Ollama (local) OR OpenAI API key |
 | Shell                | Bash or Zsh                      |
 
@@ -72,16 +72,7 @@ export OPENAI_API_KEY="your-key"
 | **scan-standards** | Check compliance with HIPAA, PCI-DSS, SOC2, ISO27001, FedRAMP | `noor scan-standards src/ --standard hipaa`         |
 | **unified-scan**   | Merge security and compliance findings into one report        | `noor unified-scan .`                               |
 
-### Cache Management (Phase 5 & Phase C)
-
-| Command                | Purpose                                                   | Usage                                              |
-| ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
-| **cache stats**        | Show cache statistics (analysis + remediation)            | `noor cache stats`                                 |
-| **cache clear**        | Clear all cached findings and remediation results         | `noor cache clear` or `noor cache clear --confirm` |
-| **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
-| **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
-
-### Decision Management (Phase 3)
+### Decision Management
 
 | Command       | Purpose                                                                         | Usage                                         |
 | ------------- | ------------------------------------------------------------------------------- | --------------------------------------------- |
@@ -89,6 +80,15 @@ export OPENAI_API_KEY="your-key"
 | **decisions** | Query stored decisions (list, show, export)                                     | `noor decisions list --priority P1`           |
 | **history**   | Track and compare decision versions over time                                   | `noor history show requirements.txt`          |
 | **metrics**   | View decision analytics dashboards and trends                                   | `noor metrics dashboard --period 30`          |
+
+### Cache Management
+
+| Command                | Purpose                                                   | Usage                                              |
+| ---------------------- | --------------------------------------------------------- | -------------------------------------------------- |
+| **cache stats**        | Show cache statistics (analysis + remediation)            | `noor cache stats`                                 |
+| **cache clear**        | Clear all cached findings and remediation results         | `noor cache clear` or `noor cache clear --confirm` |
+| **cache info**         | Display detailed cache location and metrics               | `noor cache info`                                  |
+| **cache reset-hashes** | Reset file hash tracking (forces re-hashing of all files) | `noor cache reset-hashes --confirm`                |
 
 ---
 
@@ -285,6 +285,13 @@ Add these flags to analyze, suggest, audit-security, gdpr, and scan-standards co
 --interactive (-i)     # Prompt before upgrading each dependency
 --undo                 # Restore from backup
 ```
+
+`analyze-deps` follows dependencies recursively from the direct requirements in
+the manifest, using the matching lockfile to determine resolved package versions
+and dependency edges. It currently supports `package-lock.json` for Node.js and
+`uv.lock`, `poetry.lock`, or `Pipfile.lock` for Python. Without a supported
+lockfile next to the manifest, it can only analyze the dependencies declared
+directly in that manifest.
 
 ### audit-security
 

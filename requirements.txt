@@ -24,3 +24,5 @@ tabulate
 
 # Performance monitoring
 psutil
+packaging
+tomli; python_version < "3.11"
